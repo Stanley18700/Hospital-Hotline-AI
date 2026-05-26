@@ -1,0 +1,76 @@
+{
+  "five_level_triage": {
+    "triage_levels": [
+      {
+        "level": 1,
+        "color": "Red",
+        "key_question": "Is the patient dying?",
+        "examples": ["Cardiac Arrest", "Respiratory Arrest", "Anaphylaxis", "Unresponsiveness", "Hypoglycemia", "Imminent Childbirth", "Limb Amputations"],
+        "response_time": "Immediate",
+        "placement": "Cardiac/Pulmonary Arrest → Code Bed; Others → Treatment Area"
+      },
+      {
+        "level": 2,
+        "color": "Orange",
+        "key_question": "High-risk situation? Is this a patient who shouldn't wait?",
+        "examples": ["Confused", "Lethargic", "Disoriented", "Severe Pain", "Active Chest Pain", "Suspected Coronary Syndrome", "Signs of Stroke", "Immunocompromised with fever", "Suicidal", "Homicidal", "Amputations"],
+        "response_time": "10-15 minutes",
+        "placement": "Treatment Area"
+      },
+      {
+        "level": 3,
+        "color": "Yellow",
+        "key_question": "How many resources? (2 or more) — Consider Vital Signs",
+        "examples": ["Danger Zone Vitals: Age <3mos (Pulse >155, RR >50)", "Age 3-8y (Pulse >160, RR >40)", "Age >8y (Pulse >100, RR >20)", "Temperature: Birth to 6 months (consider upgrading to Level 2)"],
+        "response_time": "60 minutes",
+        "placement": "Treatment Area"
+      },
+      {
+        "level": 4,
+        "color": "Green",
+        "key_question": "How many resources? (ONE) — Stable Vital Signs",
+        "examples": ["Ankle Sprain", "Strep Throat", "UTI", "Migraines with CT Head", "Simple Lacerations", "IV/IM Meds"],
+        "response_time": "2 hours",
+        "placement": "Holding/Monitoring Area"
+      },
+      {
+        "level": 5,
+        "color": "Blue",
+        "key_question": "How many resources? (NONE)",
+        "examples": ["Medication Refill", "Out-patient for consultation only"],
+        "response_time": "4 hours",
+        "placement": "Waiting Area"
+      }
+    ],
+    "er_triage_team_composition": [
+      {
+        "role": "Team Leader / Triage Nurse",
+        "count": 1,
+        "responsibilities": [
+          "Overall in-charge of the triage team",
+          "Perform quick assessment and brief history taking",
+          "Assign appropriate triage levels",
+          "Manage ED patient flow"
+        ]
+      },
+      {
+        "role": "Treatment Nurse",
+        "count": 3,
+        "responsibilities": [
+          "Thorough assessment of Level 1, 2, and 3 patients",
+          "Perform necessary nursing interventions",
+          "Administer Code Blue Protocols for Cardiac/Pulmonary Arrest",
+          "Refer patient to the ROD for proper management",
+          "Carry out doctor's orders"
+        ]
+      },
+      {
+        "role": "Monitoring Nurse",
+        "count": 1,
+        "responsibilities": [
+          "Care of patients assigned to Level 4 and Level 5"
+        ]
+      }
+    ]
+  }
+}

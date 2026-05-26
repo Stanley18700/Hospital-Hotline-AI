@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { api } from '../api';
 import { EmergencyBanner } from '../components/EmergencyBanner';
 import { Layout } from '../components/Layout';
+import { SecurePiiForm } from '../components/SecurePiiForm';
 import { useChat } from '../hooks/useChat';
 import { useLanguage, useSessionStorage } from '../hooks/useSession';
 import { useVoiceCall } from '../hooks/useVoiceCall';
@@ -49,12 +50,16 @@ export function CallPage() {
   const { language, setLanguage } = useLanguage();
   const { sessionId, setSessionId } = useSessionStorage();
 
-  const { assessment, sendMessage } = useChat(sessionId, language);
+  const { assessment, phase, piiReceipt, sendMessage, submitEmergencyPii } = useChat(
+    sessionId,
+    language,
+  );
 
   const greeting = t('callGreeting');
 
   const voiceCall = useVoiceCall({
     language,
+    sessionId,
     initialGreeting: greeting,
     onGreeting: (text) => {
       if (!sessionId) return;
@@ -75,8 +80,22 @@ export function CallPage() {
   });
 
   const callActive = voiceCall.state !== 'idle' && voiceCall.state !== 'error';
+  const piiRequired = phase === 'pii_collect';
   const autoStartedRef = useRef(false);
   const [autoStartBlocked, setAutoStartBlocked] = useState(false);
+
+  // The voice loop has two ways to learn the call must yield to the
+  // secure form: (1) the /stt 409 phase guard fires mid-turn (handled
+  // inside the hook), or (2) the previous chat-adk response surfaced
+  // ``next_action="collect_pii"`` and useChat updated phase. Handle
+  // case (2) here so the mic never re-opens after the assistant's
+  // confirmation reply finishes playing.
+  useEffect(() => {
+    if (piiRequired && callActive) {
+      voiceCall.requirePii();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [piiRequired, callActive]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -120,6 +139,8 @@ export function CallPage() {
         return t('callStateSpeaking');
       case 'muted':
         return t('callStateMuted');
+      case 'pii_required':
+        return t('callStatePiiRequired');
       case 'error':
         return voiceCall.error ?? '';
       default:
@@ -246,13 +267,22 @@ export function CallPage() {
             </div>
           )}
 
-          {assessment?.emergency && (
+          {assessment?.emergency && !piiRequired && (
             <EmergencyBanner
               message={assessment.emergency.alertMessage}
               ctaLabel={t('callStaffNow')}
               onCtaClick={() => {
                 window.alert(t('callStaffInstruction'));
               }}
+            />
+          )}
+
+          {(piiRequired || piiReceipt) && (
+            <SecurePiiForm
+              onSubmit={submitEmergencyPii}
+              triageLevel={assessment?.adk?.triageLevel}
+              triageColor={assessment?.adk?.triageColor}
+              receipt={piiReceipt}
             />
           )}
 
@@ -271,7 +301,7 @@ export function CallPage() {
                 {t('callTapToStart')}
               </button>
             )}
-            {callActive && (
+            {callActive && !piiRequired && (
               <button
                 type="button"
                 className={`call-btn mute${voiceCall.muted ? ' muted' : ''}`}

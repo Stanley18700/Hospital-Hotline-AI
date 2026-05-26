@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 LanguageCode = Literal["th", "en"]
 SessionStatus = Literal["active", "completed", "reset", "escalated"]
@@ -194,6 +194,118 @@ class ChatResponse(BaseModel):
     latency_ms: int | None = None
     alert_sent: bool = False
     assistant_message_id: UUID | None = None
+
+
+# Stable vocabulary the ADK triage runner returns. Keep in sync with
+# :data:`app.agent.triage_runner.NextAction`.
+AdkNextAction = Literal[
+    "await_followup",
+    "complete",
+    "escalate",
+    "collect_pii",
+    "error",
+]
+
+
+class ChatAdkExtras(BaseModel):
+    """ADK-specific payload returned alongside the legacy ChatResponse fields.
+
+    These fields are *additive* -- they let the frontend switch on a
+    stable vocabulary (``next_action``) and render the secure PII form
+    or escalation banner without having to re-derive state from the
+    free-form ``reply`` text.
+    """
+
+    next_action: AdkNextAction
+    state: str
+    triage_result: dict[str, Any] | None = None
+    advice: dict[str, Any] | None = None
+    follow_up_question: str | None = None
+    alert_requested: bool = False
+    pii_collection_requested: bool = False
+    error: str | None = None
+
+
+class ChatAdkResponse(ChatResponse):
+    """Response from the ADK chat endpoint.
+
+    Mirrors :class:`ChatResponse` so existing clients keep working, and
+    layers an :attr:`adk` block on top for the new triage signals.
+    """
+
+    adk: ChatAdkExtras
+
+
+class EmergencyPiiRequest(BaseModel):
+    """Secure-form payload for ``POST /sessions/{id}/emergency-pii``.
+
+    All three core fields are REQUIRED -- the endpoint is the official
+    Level 1 hand-off, so we refuse partial submissions. ``notes`` is
+    optional (e.g. apartment number, gate code).
+
+    Privacy contract: these values arrive on the API surface and are
+    handed directly to the notification sink. They are NEVER passed
+    to the ADK runner / Vertex, NEVER logged in the clear, and NEVER
+    persisted to Postgres in the current demo build.
+    """
+
+    name: str = Field(
+        min_length=1,
+        max_length=200,
+        description="Patient or caller's full name.",
+    )
+    phone: str = Field(
+        min_length=3,
+        max_length=64,
+        pattern=r"^[\d\s\-\+\(\)\.]{3,64}$",
+        description="Callback phone number. Digits, spaces, dashes, plus, parens, and dots only.",
+    )
+    address: str = Field(
+        min_length=3,
+        max_length=500,
+        description="Dispatch address.",
+    )
+    notes: str | None = Field(
+        default=None,
+        max_length=500,
+        description="Optional dispatcher hints (apartment number, gate code, landmarks).",
+    )
+
+    @field_validator("name", "address", "notes", "phone", mode="before")
+    @classmethod
+    def _strip(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+
+class EmergencyPiiResponse(BaseModel):
+    """Acknowledgement returned to the secure form on the client.
+
+    Deliberately minimal: only what the patient-facing UI needs to
+    render the post-submission confirmation screen. No PII echoes,
+    no received-field list (already in ``sessions.metadata`` for the
+    admin dashboard), no internal sink-result map.
+    """
+
+    case_id: str
+    alert_sent: bool
+    next_instruction: str
+
+
+class SessionPhaseOut(BaseModel):
+    """Read-only projection of the session's triage phase.
+
+    Used by ``GET /sessions/{id}/phase`` for the frontend to poll when
+    it needs to know whether to render the chat input or the secure
+    PII form. The phase mirrors :class:`TriageState` values.
+    """
+
+    session_id: UUID
+    phase: str
+    pii_collection_requested: bool
+    pii_received_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class ConversationSummaryOut(BaseModel):

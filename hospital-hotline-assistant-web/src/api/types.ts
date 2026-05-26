@@ -129,6 +129,42 @@ export interface ChatRequestPayload {
   history?: Array<Record<string, unknown>>;
 }
 
+export type AdkNextAction =
+  | 'await_followup'
+  | 'classified'
+  | 'collect_pii'
+  | 'dispatched'
+  | 'done'
+  | 'error';
+
+export type TriagePhase = 'triage' | 'pii_collect' | 'done';
+
+export interface ChatAdkExtras {
+  next_action: AdkNextAction;
+  state: TriagePhase;
+  follow_up_question?: string | null;
+  triage_result?: {
+    level?: number;
+    color?: string;
+    response_time?: string;
+    placement?: string;
+    symptoms_summary?: string;
+    reasoning?: string;
+    is_emergency?: boolean;
+  } | null;
+  advice?: {
+    department?: string;
+    interim_action?: string;
+    urgency_statement?: string;
+    response_time?: string;
+    placement?: string;
+  } | null;
+  pii_collection_requested?: boolean;
+  alert_requested?: boolean;
+  tool_calls?: Array<Record<string, unknown>>;
+  error?: string | null;
+}
+
 export interface ChatResponsePayload {
   reply: string;
   severity: {
@@ -157,6 +193,45 @@ export interface ChatResponsePayload {
   latency_ms?: number | null;
   alert_sent?: boolean;
   assistant_message_id?: string | null;
+  /**
+   * Present when the response came from POST /sessions/{id}/chat-adk.
+   * Carries the structured ADK runner output (next_action, state,
+   * triage classification, department advice, etc).
+   */
+  adk?: ChatAdkExtras | null;
+}
+
+export interface SessionPhaseOut {
+  session_id: string;
+  phase: TriagePhase;
+  pii_collection_requested: boolean;
+  pii_received_at: string | null;
+  updated_at: string | null;
+}
+
+export interface EmergencyPiiRequest {
+  name: string;
+  phone: string;
+  address: string;
+  notes?: string | null;
+}
+
+export interface EmergencyPiiResponse {
+  case_id: string;
+  alert_sent: boolean;
+  next_instruction: string;
+}
+
+/**
+ * Structured 409 body returned by /stt when the session is in
+ * PII_COLLECT phase. The audio is rejected before it reaches
+ * Cloud STT so no PII can leak into transcripts.
+ */
+export interface PiiCollectionGateDetail {
+  code: 'pii_collection_active';
+  next_action: 'collect_pii';
+  state: TriagePhase;
+  message: string;
 }
 
 export interface FollowUpQuestionOut {
@@ -186,5 +261,10 @@ export interface SttResponsePayload {
 }
 
 export interface ApiError {
-  detail: string;
+  /**
+   * FastAPI returns either a plain string (most endpoints) or a
+   * structured object (e.g. the /stt phase guard). The client
+   * preserves the original shape so callers can branch on it.
+   */
+  detail: string | Record<string, unknown>;
 }

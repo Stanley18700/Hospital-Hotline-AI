@@ -89,7 +89,9 @@ export function useSpeechRecognition(language: AppLanguage) {
       }
 
       try {
-        const result = await api.stt(audioBlob, language, fileNameForMime(blobType));
+        const result = await api.stt(audioBlob, language, {
+          filename: fileNameForMime(blobType),
+        });
         setTranscript(result.transcript);
         setConfidence(result.confidence);
         if (!result.transcript) {

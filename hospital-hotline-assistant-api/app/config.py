@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     google_model_name: str = "gemini-2.5-flash"
     google_application_credentials: str | None = None
     google_ai_enabled: bool = False
+    # Upper bound on how many times the ADK LoopAgent re-runs the
+    # triage reasoner per HTTP turn. The inner LlmAgent already does
+    # its own multi-tool micro-loop in a single run, so this is a
+    # safety cap, not a normal-path tuning knob. Keep small to bound
+    # latency.
+    adk_max_tool_iterations: int = 3
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

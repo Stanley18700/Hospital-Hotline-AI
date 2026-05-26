@@ -6,6 +6,7 @@ import { EmergencyBanner } from '../components/EmergencyBanner';
 import { Layout } from '../components/Layout';
 import { MessageBubble, TypingIndicator } from '../components/MessageBubble';
 import { RecommendationCard } from '../components/RecommendationCard';
+import { SecurePiiForm } from '../components/SecurePiiForm';
 import { VoiceControls } from '../components/VoiceControls';
 import { useChat } from '../hooks/useChat';
 import { useLanguage, useSessionStorage } from '../hooks/useSession';
@@ -26,8 +27,11 @@ export function ChatPage() {
     isSending,
     error,
     assessment,
+    phase,
+    piiReceipt,
     loadMessages,
     sendMessage,
+    submitEmergencyPii,
   } = useChat(sessionId, language);
 
   const speech = useSpeechRecognition(language);
@@ -36,12 +40,24 @@ export function ChatPage() {
 
   const voiceCall = useVoiceCall({
     language,
+    sessionId,
     onTranscript: async (transcript) => {
       const result = await sendMessage(transcript, 'voice');
       return result?.response.reply ?? null;
     },
   });
   const callActive = voiceCall.state !== 'idle' && voiceCall.state !== 'error';
+  const piiRequired = phase === 'pii_collect';
+
+  // Park the voice loop when the chat-adk response transitions to
+  // PII_COLLECT. This keeps the mic closed so the secure form is the
+  // only path forward, matching the backend's expectations.
+  useEffect(() => {
+    if (piiRequired && callActive) {
+      voiceCall.requirePii();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [piiRequired, callActive]);
 
   useEffect(() => {
     if (frontdeskMode && synthesis.supported) {
@@ -221,7 +237,7 @@ export function ChatPage() {
           </div>
         )}
 
-        {assessment?.emergency && (
+        {assessment?.emergency && !piiRequired && (
           <EmergencyBanner
             message={assessment.emergency.alertMessage}
             ctaLabel={t('callStaffNow')}
@@ -231,7 +247,16 @@ export function ChatPage() {
           />
         )}
 
-        {assessment && <RecommendationCard assessment={assessment} />}
+        {(piiRequired || piiReceipt) && (
+          <SecurePiiForm
+            onSubmit={submitEmergencyPii}
+            triageLevel={assessment?.adk?.triageLevel}
+            triageColor={assessment?.adk?.triageColor}
+            receipt={piiReceipt}
+          />
+        )}
+
+        {assessment && !piiRequired && <RecommendationCard assessment={assessment} />}
 
         {assessment?.followUpQuestion && (
           <div className="follow-up-card">
@@ -304,15 +329,21 @@ export function ChatPage() {
                 void handleSend();
               }
             }}
-            placeholder={callActive ? t('callHintActive') : t('typeMessage')}
-            disabled={isSending || callActive}
+            placeholder={
+              piiRequired
+                ? t('callStatePiiRequired')
+                : callActive
+                  ? t('callHintActive')
+                  : t('typeMessage')
+            }
+            disabled={isSending || callActive || piiRequired}
             aria-label={t('typeMessage')}
           />
           <button
             type="button"
             className="primary-btn"
             onClick={() => void handleSend()}
-            disabled={isSending || !input.trim() || callActive}
+            disabled={isSending || !input.trim() || callActive || piiRequired}
           >
             {t('send')}
           </button>

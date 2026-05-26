@@ -1,6 +1,5 @@
-import { baseUrl, request } from './client';
+import { ApiClientError, baseUrl, parseErrorBody, request } from './client';
 import type {
-  ApiError,
   ChatRequestPayload,
   ChatResponsePayload,
   ConversationSummaryOut,
@@ -8,6 +7,8 @@ import type {
   DepartmentRecommendationCreate,
   EmergencyEventOut,
   EmergencyEventCreate,
+  EmergencyPiiRequest,
+  EmergencyPiiResponse,
   EmergencyTriggerOut,
   FollowUpQuestionOut,
   LanguageCode,
@@ -16,22 +17,12 @@ import type {
   RoutingRuleOut,
   SessionCreate,
   SessionOut,
+  SessionPhaseOut,
   SessionUpdate,
   SeverityAssessmentCreate,
   SttResponsePayload,
   SymptomEntryCreate,
 } from './types';
-
-async function detailFromResponse(response: Response): Promise<string> {
-  let detail = response.statusText;
-  try {
-    const body = (await response.json()) as ApiError;
-    detail = body.detail ?? detail;
-  } catch {
-    // ignore
-  }
-  return detail;
-}
 
 async function ttsRequest(payload: { text: string; language: LanguageCode }): Promise<Blob> {
   const response = await fetch(`${baseUrl}/tts`, {
@@ -40,7 +31,7 @@ async function ttsRequest(payload: { text: string; language: LanguageCode }): Pr
     body: JSON.stringify(payload),
   });
   if (!response.ok) {
-    throw new Error(await detailFromResponse(response));
+    throw new ApiClientError(response.status, await parseErrorBody(response));
   }
   return response.blob();
 }
@@ -49,17 +40,24 @@ async function sttRequest(payload: {
   audio: Blob;
   language: LanguageCode;
   filename?: string;
+  sessionId?: string | null;
 }): Promise<SttResponsePayload> {
   const form = new FormData();
   form.append('audio', payload.audio, payload.filename ?? 'speech.webm');
   form.append('language', payload.language);
+  // Pass session_id so the backend can refuse transcription (HTTP 409)
+  // when the session is in PII_COLLECT phase. The audio never reaches
+  // Cloud STT in that case, protecting PII from showing up in transcripts.
+  if (payload.sessionId) {
+    form.append('session_id', payload.sessionId);
+  }
 
   const response = await fetch(`${baseUrl}/stt`, {
     method: 'POST',
     body: form,
   });
   if (!response.ok) {
-    throw new Error(await detailFromResponse(response));
+    throw new ApiClientError(response.status, await parseErrorBody(response));
   }
   return response.json() as Promise<SttResponsePayload>;
 }
@@ -90,8 +88,40 @@ export const api = {
   listMessages: (sessionId: string) =>
     request<MessageOut[]>(`/sessions/${sessionId}/messages`),
 
+  /**
+   * Primary chat endpoint. Routes through the Google ADK triage agent
+   * (Vertex AI Gemini + tools) on the backend. Responses include the
+   * legacy ChatResponse fields PLUS an ``adk`` block carrying the
+   * runner output (state, next_action, triage classification, etc).
+   */
   chat: (sessionId: string, payload: ChatRequestPayload) =>
+    request<ChatResponsePayload>(`/sessions/${sessionId}/chat-adk`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  /**
+   * Legacy rule-engine + direct-Vertex chat endpoint. Kept as a
+   * fallback in case the ADK runner needs to be bypassed for an
+   * incident. Not used in the default UI flow anymore.
+   */
+  chatLegacy: (sessionId: string, payload: ChatRequestPayload) =>
     request<ChatResponsePayload>(`/sessions/${sessionId}/chat`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  getSessionPhase: (sessionId: string) =>
+    request<SessionPhaseOut>(`/sessions/${sessionId}/phase`),
+
+  /**
+   * Submit the patient's secure PII (name, phone, address) after a
+   * Level 1 emergency. This call never touches the LLM. The backend
+   * generates a case_id, dispatches Slack/admin notifications, and
+   * marks the session as DONE.
+   */
+  submitEmergencyPii: (sessionId: string, payload: EmergencyPiiRequest) =>
+    request<EmergencyPiiResponse>(`/sessions/${sessionId}/emergency-pii`, {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
@@ -158,8 +188,19 @@ export const api = {
 
   tts: (text: string, language: LanguageCode) => ttsRequest({ text, language }),
 
-  stt: (audio: Blob, language: LanguageCode, filename?: string) =>
-    sttRequest({ audio, language, filename }),
+  stt: (
+    audio: Blob,
+    language: LanguageCode,
+    options?: { filename?: string; sessionId?: string | null },
+  ) =>
+    sttRequest({
+      audio,
+      language,
+      filename: options?.filename,
+      sessionId: options?.sessionId,
+    }),
 };
+
+export { ApiClientError, isPiiCollectionGate } from './client';
 
 export type { MessageOut, SessionOut, ConversationSummaryOut, DepartmentOut };

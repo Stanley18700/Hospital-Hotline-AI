@@ -600,6 +600,198 @@ a:hover {
   border-color: var(--mch-red-dark);
 }
 
+.secure-pii-form {
+  background: #ffffff;
+  border: 1px solid var(--mch-red);
+  border-left: 6px solid var(--mch-red);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.5rem;
+  box-shadow: 0 8px 24px rgba(214, 57, 51, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.secure-pii-form-header {
+  display: flex;
+  gap: 0.85rem;
+  align-items: flex-start;
+}
+
+.secure-pii-form-badge,
+.secure-pii-form-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 999px;
+  background: var(--mch-red);
+  color: #ffffff;
+  font-size: 1.05rem;
+  flex-shrink: 0;
+}
+
+.secure-pii-form.receipt .secure-pii-form-icon {
+  background: #1f8a4c;
+}
+
+.secure-pii-form-header h2 {
+  margin: 0 0 0.15rem;
+  font-family: var(--font-heading);
+  font-size: 1.15rem;
+  color: var(--mch-red);
+}
+
+.secure-pii-form.receipt .secure-pii-form-header h2 {
+  color: #1f8a4c;
+}
+
+.secure-pii-form-header p {
+  margin: 0;
+  font-size: 0.92rem;
+}
+
+.secure-pii-form-triage {
+  background: var(--color-emergency-bg, #fde6e6);
+  border: 1px solid var(--color-emergency-border, #f4b9b9);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.75rem;
+  color: #7f1d1d;
+  font-size: 0.9rem;
+}
+
+.secure-pii-form-triage.triage-red {
+  background: #fde6e6;
+  border-color: #f4b9b9;
+  color: #7f1d1d;
+}
+
+.secure-pii-form-triage.triage-orange {
+  background: #fff1de;
+  border-color: #ffd6a3;
+  color: #8a4b00;
+}
+
+.secure-pii-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.secure-pii-field label {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.secure-pii-field input,
+.secure-pii-field textarea {
+  font: inherit;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  background: #ffffff;
+  min-height: 44px;
+  resize: vertical;
+}
+
+.secure-pii-field input:focus,
+.secure-pii-field textarea:focus {
+  outline: 2px solid var(--mch-red);
+  outline-offset: 1px;
+  border-color: var(--mch-red);
+}
+
+.secure-pii-field input[aria-invalid='true'],
+.secure-pii-field textarea[aria-invalid='true'] {
+  border-color: var(--mch-red);
+  background: #fff8f7;
+}
+
+.secure-pii-field-error {
+  margin: 0;
+  color: var(--mch-red-dark);
+  font-size: 0.85rem;
+}
+
+.secure-pii-form-error {
+  margin: 0;
+  padding: 0.6rem 0.75rem;
+  background: #fde6e6;
+  border: 1px solid #f4b9b9;
+  border-radius: var(--radius-sm);
+  color: #7f1d1d;
+  font-size: 0.9rem;
+}
+
+.secure-pii-form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.secure-pii-form-actions .primary-btn {
+  background: var(--mch-red);
+  border-color: var(--mch-red);
+  min-height: 44px;
+  padding: 0.6rem 1.25rem;
+  font-weight: 600;
+}
+
+.secure-pii-form-actions .primary-btn:hover:not(:disabled) {
+  background: var(--mch-red-dark);
+  border-color: var(--mch-red-dark);
+}
+
+.secure-pii-disclaimer {
+  margin: 0;
+  font-size: 0.85rem;
+  max-width: 60%;
+}
+
+.secure-pii-receipt-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+}
+
+.secure-pii-receipt-grid > div {
+  background: var(--color-bg-alt);
+  border-radius: var(--radius-sm);
+  padding: 0.6rem 0.75rem;
+}
+
+.secure-pii-receipt-grid dt {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6b6b6b;
+  margin: 0 0 0.2rem;
+}
+
+.secure-pii-receipt-grid dd {
+  margin: 0;
+  font-weight: 600;
+}
+
+.secure-pii-receipt-grid code {
+  font-family: 'Fira Code', 'Consolas', monospace;
+  font-size: 0.95rem;
+  background: #ffffff;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  padding: 0.1rem 0.4rem;
+}
+
+.secure-pii-next-instruction {
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
 .recommendation-card {
   background: var(--color-bg-alt);
   border: 2px solid var(--color-border);

@@ -99,3 +99,105 @@ class SlackNotifier:
         async with httpx.AsyncClient(timeout=6.0) as client:
             response = await client.post(settings.slack_webhook_url, json=payload)
             return response.status_code < 300
+
+    async def send_emergency_dispatch(
+        self,
+        *,
+        case_id: str,
+        session_id: str,
+        language: str,
+        triage_level: int | None,
+        triage_color: str | None,
+        symptoms_summary: str | None,
+        patient_name: str,
+        patient_phone: str,
+        patient_address: str,
+        patient_notes: str | None = None,
+    ) -> bool:
+        """Post a Level 1 ambulance / admin dispatch alert to Slack.
+
+        Distinct from :meth:`send_alert` (which is used by the
+        conversational /chat path). This variant intentionally
+        includes patient identifiers because the Slack channel is the
+        backend's hand-off to a human dispatcher -- the LLM is not on
+        this path. The payload format is similar to ``send_alert`` so
+        the same Slack channel can be used for both flows.
+
+        Privacy note: this is the ONLY part of the codebase that
+        formats PII into a Slack payload. The PII passes from the
+        FastAPI request body, through :class:`SlackPiiHandoffSink`,
+        directly to this method, and out to the configured Slack
+        webhook. It never touches the ADK runner or Vertex.
+
+        Returns ``True`` on a 2xx response from the Slack webhook,
+        ``False`` otherwise (including when ``slack_webhook_url`` is
+        unset). Never raises.
+        """
+
+        if not settings.slack_webhook_url:
+            return False
+
+        level_label = (
+            f"Level {triage_level}" + (f" ({triage_color})" if triage_color else "")
+            if triage_level is not None
+            else (triage_color or "Level 1 (Red)")
+        )
+
+        fields = [
+            {"type": "mrkdwn", "text": f"*Case:*\n`{case_id}`"},
+            {"type": "mrkdwn", "text": f"*Session:*\n`{session_id}`"},
+            {"type": "mrkdwn", "text": f"*Triage:*\n{level_label}"},
+            {"type": "mrkdwn", "text": f"*Language:*\n{language}"},
+            {"type": "mrkdwn", "text": f"*Patient:*\n{patient_name}"},
+            {"type": "mrkdwn", "text": f"*Phone:*\n{patient_phone}"},
+        ]
+
+        payload: dict[str, Any] = {
+            "text": f"Hospital Hotline EMERGENCY DISPATCH - {case_id}",
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": f"EMERGENCY DISPATCH - {level_label}",
+                    },
+                },
+                {"type": "section", "fields": fields},
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Address:*\n{patient_address}",
+                    },
+                },
+            ],
+        }
+
+        if patient_notes:
+            payload["blocks"].append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Dispatcher notes:*\n{patient_notes}",
+                    },
+                }
+            )
+
+        if symptoms_summary:
+            payload["blocks"].append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Symptoms summary:*\n{symptoms_summary}",
+                    },
+                }
+            )
+
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                response = await client.post(settings.slack_webhook_url, json=payload)
+                return response.status_code < 300
+        except httpx.HTTPError:
+            return False

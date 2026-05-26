@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api } from '../api';
+import { api, isPiiCollectionGate } from '../api';
 import type { AppLanguage } from '../i18n/resources';
 
 export type VoiceCallState =
@@ -11,11 +11,28 @@ export type VoiceCallState =
   | 'thinking'
   | 'speaking'
   | 'muted'
+  | 'pii_required'
   | 'error';
 
 export interface UseVoiceCallOptions {
   language: AppLanguage;
+  /**
+   * The current backend session ID. Passed to /stt so the backend can
+   * enforce the PII_COLLECT phase guard and refuse transcription with
+   * HTTP 409 instead of routing audio through Cloud STT. Required for
+   * the secure flow to work end-to-end; the call still functions if
+   * omitted but the voice phase guard becomes a no-op.
+   */
+  sessionId?: string | null;
   onTranscript: (transcript: string) => Promise<string | null | undefined>;
+  /**
+   * Fired when the backend signals (via /stt 409 or via the previous
+   * /chat-adk turn's ``next_action="collect_pii"``) that the voice
+   * loop must yield to the secure PII form. The hook will park itself
+   * in the ``'pii_required'`` state and stop opening the mic. The
+   * parent UI should render the SecurePiiForm.
+   */
+  onPiiRequired?: () => void;
   /**
    * Optional scripted line the assistant speaks immediately after the call
    * connects, before the mic opens for the first user turn. Use this for the
@@ -38,11 +55,19 @@ interface UseVoiceCallApi {
   lastTranscript: string;
   lastReply: string;
   muted: boolean;
+  piiRequired: boolean;
   start: () => Promise<void>;
   end: () => void;
   mute: () => void;
   unmute: () => Promise<void>;
   toggleMute: () => Promise<void>;
+  /**
+   * Park the voice loop in the ``'pii_required'`` state without
+   * tearing the call down. The parent should call this after the
+   * ADK response surfaces ``next_action="collect_pii"`` so the mic
+   * does not re-open while the secure form is on screen.
+   */
+  requirePii: () => void;
 }
 
 const voiceFeatureEnabled = import.meta.env.VITE_ENABLE_VOICE === 'true';
@@ -91,7 +116,8 @@ function fileNameForMime(mime: string): string {
  * round-trips through /stt -> /chat -> /tts, then re-opens the mic.
  */
 export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
-  const { language, onTranscript, initialGreeting, onGreeting } = options;
+  const { language, sessionId, onTranscript, onPiiRequired, initialGreeting, onGreeting } =
+    options;
 
   const [state, setState] = useState<VoiceCallState>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -99,15 +125,19 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
   const [lastReply, setLastReply] = useState('');
   const [supported, setSupported] = useState(false);
   const [muted, setMuted] = useState(false);
+  const [piiRequired, setPiiRequired] = useState(false);
 
   // Refs are used so async callbacks always see the latest values
   // without forcing the start/end functions to re-create.
   const stateRef = useRef<VoiceCallState>('idle');
   const activeRef = useRef(false);
   const mutedRef = useRef(false);
+  const piiRequiredRef = useRef(false);
   const generationRef = useRef(0);
   const languageRef = useRef(language);
+  const sessionIdRef = useRef<string | null | undefined>(sessionId);
   const onTranscriptRef = useRef(onTranscript);
+  const onPiiRequiredRef = useRef(onPiiRequired);
   const initialGreetingRef = useRef(initialGreeting);
   const onGreetingRef = useRef(onGreeting);
 
@@ -124,7 +154,9 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
   const playingAudioUrlRef = useRef<string | null>(null);
 
   languageRef.current = language;
+  sessionIdRef.current = sessionId;
   onTranscriptRef.current = onTranscript;
+  onPiiRequiredRef.current = onPiiRequired;
   initialGreetingRef.current = initialGreeting;
   onGreetingRef.current = onGreeting;
 
@@ -254,12 +286,29 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
       updateState('uploading');
       let transcript = '';
       try {
-        const result = await api.stt(blob, languageRef.current, fileNameForMime(blobType));
+        const result = await api.stt(blob, languageRef.current, {
+          filename: fileNameForMime(blobType),
+          sessionId: sessionIdRef.current ?? undefined,
+        });
         if (gen !== generationRef.current || !activeRef.current) return;
         transcript = result.transcript?.trim() ?? '';
         setLastTranscript(transcript);
       } catch (err) {
         if (gen !== generationRef.current || !activeRef.current) return;
+        // Backend refused the audio because the session is in
+        // PII_COLLECT phase. Surface the gate so the parent UI
+        // renders the secure form instead of opening the mic again.
+        if (isPiiCollectionGate(err)) {
+          piiRequiredRef.current = true;
+          setPiiRequired(true);
+          updateState('pii_required');
+          try {
+            onPiiRequiredRef.current?.();
+          } catch {
+            // best-effort
+          }
+          return;
+        }
         setError(err instanceof Error ? err.message : 'Speech recognition failed');
         // Recover: try listening again rather than ending the call
         await listenOnceRef.current?.();
@@ -297,7 +346,9 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
       await speakTextRef.current?.(reply, gen);
 
       if (activeRef.current && gen === generationRef.current) {
-        if (mutedRef.current) {
+        if (piiRequiredRef.current) {
+          updateState('pii_required');
+        } else if (mutedRef.current) {
           updateState('muted');
         } else {
           await listenOnceRef.current?.();
@@ -346,6 +397,12 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
 
   const listenOnce = useCallback(async () => {
     if (!activeRef.current) return;
+    if (piiRequiredRef.current) {
+      // Secure form is on screen — never re-open the mic until the
+      // backend releases the session phase.
+      updateState('pii_required');
+      return;
+    }
     if (mutedRef.current) {
       // User paused the mic — stay in the muted state instead of opening it.
       updateState('muted');
@@ -497,6 +554,8 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
     activeRef.current = true;
     mutedRef.current = false;
     setMuted(false);
+    piiRequiredRef.current = false;
+    setPiiRequired(false);
     generationRef.current += 1;
     const gen = generationRef.current;
     setError(null);
@@ -529,6 +588,8 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
     activeRef.current = false;
     mutedRef.current = false;
     setMuted(false);
+    piiRequiredRef.current = false;
+    setPiiRequired(false);
     generationRef.current += 1;
     stopRecorder();
     stopPlayback();
@@ -536,6 +597,22 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
     chunksRef.current = [];
     updateState('idle');
   }, [stopRecorder, stopPlayback, releaseListeningResources, updateState]);
+
+  const requirePii = useCallback(() => {
+    // Park the loop, but keep the call "active" so any in-flight TTS
+    // playback finishes naturally. Stops the mic immediately.
+    piiRequiredRef.current = true;
+    setPiiRequired(true);
+    if (recorderRef.current && recorderRef.current.state === 'recording') {
+      stopRecorder();
+    }
+    updateState('pii_required');
+    try {
+      onPiiRequiredRef.current?.();
+    } catch {
+      // best-effort
+    }
+  }, [stopRecorder, updateState]);
 
   const mute = useCallback(() => {
     if (!activeRef.current) return;
@@ -595,10 +672,12 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
     lastTranscript,
     lastReply,
     muted,
+    piiRequired,
     start,
     end,
     mute,
     unmute,
     toggleMute,
+    requirePii,
   };
 }
