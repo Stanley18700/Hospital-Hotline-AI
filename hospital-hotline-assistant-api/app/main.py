@@ -6,7 +6,7 @@ from uuid import UUID
 import asyncpg
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 import logging
 
 from app.agent.triage_runner import TriageRunner, get_default_runner
@@ -278,6 +278,7 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
+    allow_origin_regex=settings.cors_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -993,9 +994,41 @@ async def list_emergency_events(
 
 @app.post("/tts")
 async def text_to_speech(payload: TtsRequest, request: Request):
-    """Synthesize speech for the given text. Returns audio/mpeg (MP3) bytes."""
+    """Synthesize speech for the given text.
+
+    Streams Gemini TTS audio chunk-by-chunk so the browser can begin
+    playback before synthesis finishes (typically saves 2-4 s of
+    pre-roll latency). If streaming setup fails for any reason
+    (SDK missing, network error, etc.), we transparently fall back
+    to the blocking :meth:`GoogleTtsClient.synthesize` path so the
+    caller always gets a valid WAV body.
+    """
 
     tts_client: GoogleTtsClient = request.app.state.tts_client
+
+    # Validate up-front so empty input still returns the documented
+    # 400. We do this before opening the stream because a
+    # ``StreamingResponse`` can no longer change its status code once
+    # the first byte has been flushed to the client.
+    if not payload.text or not payload.text.strip():
+        raise HTTPException(status_code=400, detail="text must not be empty")
+
+    try:
+        audio_stream = tts_client.synthesize_stream(
+            text=payload.text,
+            language=payload.language,
+        )
+        return StreamingResponse(
+            audio_stream,
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": 'inline; filename="speech.wav"',
+                "Cache-Control": "no-cache",
+            },
+        )
+    except Exception:
+        logger.exception("TTS streaming failed, falling back to non-streaming synthesize()")
+
     try:
         audio_bytes = await tts_client.synthesize(
             text=payload.text,
@@ -1008,8 +1041,8 @@ async def text_to_speech(payload: TtsRequest, request: Request):
 
     return Response(
         content=audio_bytes,
-        media_type="audio/mpeg",
-        headers={"Content-Disposition": 'inline; filename="speech.mp3"'},
+        media_type="audio/wav",
+        headers={"Content-Disposition": 'inline; filename="speech.wav"'},
     )
 
 

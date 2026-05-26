@@ -10,6 +10,20 @@ class Settings(BaseSettings):
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ]
+    # Regex companion to ``cors_origins`` so dev setups (WSL2, LAN IPs,
+    # custom Vite ports) are accepted without having to enumerate every
+    # variant. The default covers http(s)://localhost:<port>,
+    # http(s)://127.0.0.1:<port>, and any private LAN IPv4 on any port.
+    # Set to ``None`` (or override via env) to disable the regex match.
+    cors_origin_regex: str | None = (
+        r"^https?://("
+        r"localhost"
+        r"|127\.0\.0\.1"
+        r"|10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+        r"|192\.168\.\d{1,3}\.\d{1,3}"
+        r"|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}"
+        r")(:\d+)?$"
+    )
     slack_webhook_url: str | None = None
     alert_severity_threshold: str = "emergency"
     alert_cooldown_seconds: int = 300
