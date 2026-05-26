@@ -27,6 +27,22 @@ function HangUpIcon() {
   );
 }
 
+function MicIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z" />
+    </svg>
+  );
+}
+
+function MicOffIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23A6.94 6.94 0 0 0 19 11zm-4.02.17c0-.06.02-.11.02-.17V6a3 3 0 0 0-5.94-.59l5.92 5.92zM4.27 3 3 4.27l6.01 6.01V11a3 3 0 0 0 4.47 2.61l1.66 1.66A4.9 4.9 0 0 1 12 16a5 5 0 0 1-5-5H5a7 7 0 0 0 6 6.92V21h2v-3.08c.91-.13 1.77-.45 2.55-.9L19.73 21 21 19.73 4.27 3z" />
+    </svg>
+  );
+}
+
 export function CallPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -102,6 +118,8 @@ export function CallPage() {
         return t('callStateThinking');
       case 'speaking':
         return t('callStateSpeaking');
+      case 'muted':
+        return t('callStateMuted');
       case 'error':
         return voiceCall.error ?? '';
       default:
@@ -126,6 +144,36 @@ export function CallPage() {
     }
     navigate('/');
   };
+
+  const handleToggleMute = () => {
+    void voiceCall.toggleMute();
+  };
+
+  // Keyboard shortcuts:
+  //   M    - toggle mute (when the call is active)
+  //   Esc  - end call
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) {
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        void handleEndCall();
+        return;
+      }
+      if (event.key === 'm' || event.key === 'M') {
+        if (!callActive && !voiceCall.muted) return;
+        event.preventDefault();
+        handleToggleMute();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [callActive, voiceCall.muted]);
 
   if (!sessionId) {
     return null;
@@ -171,6 +219,14 @@ export function CallPage() {
             <span className={`call-status-text state-${voiceCall.state}`}>
               {statusLabel || t('callTapToStart')}
             </span>
+            {voiceCall.muted && voiceCall.state !== 'muted' && (
+              <span className="call-mute-badge" aria-live="polite">
+                <span className="call-mute-badge-icon" aria-hidden="true">
+                  <MicOffIcon />
+                </span>
+                {t('callMutedBadge')}
+              </span>
+            )}
           </div>
 
           {(voiceCall.lastTranscript || voiceCall.lastReply) && (
@@ -200,6 +256,10 @@ export function CallPage() {
             />
           )}
 
+          {voiceCall.state === 'muted' && (
+            <p className="call-mute-hint muted">{t('callMuteHint')}</p>
+          )}
+
           <div className="call-actions">
             {!callActive && autoStartBlocked && (
               <button
@@ -209,6 +269,20 @@ export function CallPage() {
               >
                 <span aria-hidden="true" className="call-btn-icon">{'\u260E'}</span>
                 {t('callTapToStart')}
+              </button>
+            )}
+            {callActive && (
+              <button
+                type="button"
+                className={`call-btn mute${voiceCall.muted ? ' muted' : ''}`}
+                onClick={handleToggleMute}
+                aria-pressed={voiceCall.muted}
+                title={voiceCall.muted ? t('unmuteMic') : t('muteMic')}
+              >
+                <span aria-hidden="true" className="call-btn-icon">
+                  {voiceCall.muted ? <MicOffIcon /> : <MicIcon />}
+                </span>
+                {voiceCall.muted ? t('unmuteMic') : t('muteMic')}
               </button>
             )}
             <button

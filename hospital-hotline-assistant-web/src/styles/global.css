@@ -745,6 +745,38 @@ a:hover {
   background: linear-gradient(135deg, var(--mch-red) 0%, var(--mch-red-dark) 100%);
 }
 
+.call-btn.mute {
+  background: var(--color-surface);
+  color: var(--mch-navy);
+  border: 2px solid var(--mch-cyan);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  padding: 0.55rem 1.25rem;
+}
+
+.call-btn.mute:hover:not(:disabled) {
+  background: #eaf6fb;
+}
+
+.call-btn.mute.muted {
+  background: linear-gradient(135deg, #5c6670 0%, #2f3640 100%);
+  border-color: transparent;
+  color: #ffffff;
+}
+
+.call-btn.mute.muted:hover:not(:disabled) {
+  background: linear-gradient(135deg, #4a525a 0%, #1f2630 100%);
+}
+
+.call-btn.mute .call-btn-icon svg {
+  width: 22px;
+  height: 22px;
+  fill: var(--mch-navy);
+}
+
+.call-btn.mute.muted .call-btn-icon svg {
+  fill: #ffffff;
+}
+
 .call-btn-icon {
   font-size: 1.15rem;
   line-height: 1;
@@ -1063,6 +1095,23 @@ a:hover {
   border-color: rgba(0, 169, 224, 0.4);
 }
 
+.call-orb-muted .call-orb-core {
+  background: linear-gradient(135deg, #98a1ad 0%, #5c6670 100%);
+  animation: none;
+  opacity: 0.85;
+}
+
+.call-orb-muted .call-orb-core svg {
+  opacity: 0.85;
+}
+
+.call-orb-muted .call-orb-ring,
+.call-orb-muted .call-orb-ring.delay {
+  animation: none;
+  border-color: rgba(92, 102, 112, 0.25);
+  opacity: 0.3;
+}
+
 @keyframes orb-pulse {
   0% {
     transform: scale(0.85);
@@ -1167,6 +1216,44 @@ a:hover {
   width: 22px;
   height: 22px;
   fill: #ffffff;
+}
+
+.call-mute-hint {
+  margin: -0.35rem 0 0;
+  font-size: 0.92rem;
+  text-align: center;
+}
+
+.call-mute-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-left: 0.6rem;
+  padding: 0.18rem 0.6rem;
+  border-radius: 999px;
+  background: #f1f3f5;
+  color: #5c6670;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border: 1px solid rgba(92, 102, 112, 0.25);
+  vertical-align: middle;
+}
+
+.call-mute-badge-icon {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+}
+
+.call-mute-badge-icon svg {
+  width: 14px;
+  height: 14px;
+  fill: #5c6670;
+}
+
+.call-status-text.state-muted {
+  color: #5c6670;
 }
 
 .call-error {

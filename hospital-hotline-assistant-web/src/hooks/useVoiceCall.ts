@@ -10,6 +10,7 @@ export type VoiceCallState =
   | 'uploading'
   | 'thinking'
   | 'speaking'
+  | 'muted'
   | 'error';
 
 export interface UseVoiceCallOptions {
@@ -36,8 +37,12 @@ interface UseVoiceCallApi {
   error: string | null;
   lastTranscript: string;
   lastReply: string;
+  muted: boolean;
   start: () => Promise<void>;
   end: () => void;
+  mute: () => void;
+  unmute: () => Promise<void>;
+  toggleMute: () => Promise<void>;
 }
 
 const voiceFeatureEnabled = import.meta.env.VITE_ENABLE_VOICE === 'true';
@@ -93,11 +98,13 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
   const [lastTranscript, setLastTranscript] = useState('');
   const [lastReply, setLastReply] = useState('');
   const [supported, setSupported] = useState(false);
+  const [muted, setMuted] = useState(false);
 
   // Refs are used so async callbacks always see the latest values
   // without forcing the start/end functions to re-create.
   const stateRef = useRef<VoiceCallState>('idle');
   const activeRef = useRef(false);
+  const mutedRef = useRef(false);
   const generationRef = useRef(0);
   const languageRef = useRef(language);
   const onTranscriptRef = useRef(onTranscript);
@@ -221,6 +228,17 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
         return;
       }
 
+      // The user pressed Mute while the mic was open. Drop the buffered
+      // audio so we don't send it to STT, and park the UI on the 'muted'
+      // screen. The rest of the pipeline (if any) is unaffected because
+      // there is no rest of the pipeline at this point — we were in
+      // 'listening'.
+      if (mutedRef.current) {
+        chunksRef.current = [];
+        updateState('muted');
+        return;
+      }
+
       const blobType = recorder?.mimeType || 'audio/webm';
       const blob = new Blob(chunksRef.current, { type: blobType });
       chunksRef.current = [];
@@ -279,7 +297,11 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
       await speakTextRef.current?.(reply, gen);
 
       if (activeRef.current && gen === generationRef.current) {
-        await listenOnceRef.current?.();
+        if (mutedRef.current) {
+          updateState('muted');
+        } else {
+          await listenOnceRef.current?.();
+        }
       }
     },
     [clearVadTimers, teardownAudioGraph, stopStream, updateState],
@@ -324,6 +346,11 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
 
   const listenOnce = useCallback(async () => {
     if (!activeRef.current) return;
+    if (mutedRef.current) {
+      // User paused the mic — stay in the muted state instead of opening it.
+      updateState('muted');
+      return;
+    }
     const gen = generationRef.current;
 
     setError(null);
@@ -468,6 +495,8 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
     }
     if (activeRef.current) return;
     activeRef.current = true;
+    mutedRef.current = false;
+    setMuted(false);
     generationRef.current += 1;
     const gen = generationRef.current;
     setError(null);
@@ -498,6 +527,8 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
 
   const end = useCallback(() => {
     activeRef.current = false;
+    mutedRef.current = false;
+    setMuted(false);
     generationRef.current += 1;
     stopRecorder();
     stopPlayback();
@@ -505,6 +536,46 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
     chunksRef.current = [];
     updateState('idle');
   }, [stopRecorder, stopPlayback, releaseListeningResources, updateState]);
+
+  const mute = useCallback(() => {
+    if (!activeRef.current) return;
+    if (mutedRef.current) return;
+    mutedRef.current = true;
+    setMuted(true);
+    // Only mute the user's microphone. The in-flight pipeline (STT upload,
+    // LLM "thinking", and AI TTS playback) keeps running. If the mic is
+    // currently open, stop the recorder so we don't capture any more audio;
+    // handleRecorderStop will see mutedRef.current === true and discard the
+    // buffered chunks instead of sending them to STT. If we're not in
+    // 'listening', do nothing here — the post-speak guard will switch the
+    // UI into the 'muted' state when the pipeline naturally reaches the
+    // point where it would re-open the mic.
+    if (stateRef.current === 'listening') {
+      stopRecorder();
+    }
+  }, [stopRecorder]);
+
+  const unmute = useCallback(async () => {
+    if (!activeRef.current) return;
+    if (!mutedRef.current) return;
+    mutedRef.current = false;
+    setMuted(false);
+    // Only force a listen turn if we are already parked at the 'muted'
+    // screen. Otherwise the pipeline is still running and its existing
+    // post-speak relisten guard will see mutedRef.current === false and
+    // auto-open the mic naturally.
+    if (stateRef.current === 'muted') {
+      await listenOnce();
+    }
+  }, [listenOnce]);
+
+  const toggleMute = useCallback(async () => {
+    if (mutedRef.current) {
+      await unmute();
+    } else {
+      mute();
+    }
+  }, [mute, unmute]);
 
   useEffect(() => {
     return () => {
@@ -523,7 +594,11 @@ export function useVoiceCall(options: UseVoiceCallOptions): UseVoiceCallApi {
     error,
     lastTranscript,
     lastReply,
+    muted,
     start,
     end,
+    mute,
+    unmute,
+    toggleMute,
   };
 }
