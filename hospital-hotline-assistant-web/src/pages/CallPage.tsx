@@ -27,6 +27,38 @@ function HangUpIcon() {
   );
 }
 
+function MicIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11h-2z" />
+    </svg>
+  );
+}
+
+function MicOffIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M19 11h-1.7c0 .58-.1 1.13-.27 1.64l1.27 1.27c.43-.9.7-1.88.7-2.91zM15 11.16V6a3 3 0 0 0-5.94-.6L15 11.16zM4.27 3 3 4.27l6.01 6.01V11a3 3 0 0 0 3 3c.22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52a5 5 0 0 1-5-5H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.55-.9L19.73 21 21 19.73 4.27 3z" />
+    </svg>
+  );
+}
+
+function SpeakerOnIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 10v4c0 .55.45 1 1 1h3l3.29 3.29c.63.63 1.71.18 1.71-.71V6.41c0-.89-1.08-1.34-1.71-.71L7 9H4c-.55 0-1 .45-1 1zm13.5 2A4.5 4.5 0 0 0 14 7.97v8.05A4.5 4.5 0 0 0 16.5 12zM14 3.23v2.06A7.001 7.001 0 0 1 19 12c0 3.21-2.16 5.92-5 6.71v2.06c3.95-.84 7-4.36 7-8.77 0-4.4-3.05-7.93-7-8.77z" />
+    </svg>
+  );
+}
+
+function SpeakerOffIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M16.5 12A4.5 4.5 0 0 0 14 7.97v2.21l2.45 2.45c.03-.21.05-.42.05-.63zM19 12c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.96 8.96 0 0 0 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3 3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.17v2.06a8.99 8.99 0 0 0 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4 9.91 6.09 12 8.18V4z" />
+    </svg>
+  );
+}
+
 export function CallPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -38,6 +70,7 @@ export function CallPage() {
   const greeting = t('callGreeting');
 
   const voiceCall = useVoiceCall({
+    sessionId,
     language,
     initialGreeting: greeting,
     onGreeting: (text) => {
@@ -53,6 +86,9 @@ export function CallPage() {
         .catch(() => undefined);
     },
     onTranscript: async (transcript) => {
+      // Live mode handles transcription server-side via Gemini Live, but
+      // we keep this callback wired so the chat hook still updates its
+      // assessment state if the future REST fallback is ever re-enabled.
       const result = await sendMessage(transcript, 'voice');
       return result?.response.reply ?? null;
     },
@@ -83,7 +119,7 @@ export function CallPage() {
 
   useEffect(() => {
     return () => {
-      voiceCall.end();
+      void voiceCall.end();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -115,7 +151,7 @@ export function CallPage() {
   };
 
   const handleEndCall = async () => {
-    voiceCall.end();
+    await voiceCall.end();
     if (sessionId) {
       try {
         await api.updateSession(sessionId, { status: 'completed' });
@@ -190,9 +226,13 @@ export function CallPage() {
             </div>
           )}
 
-          {assessment?.emergency && (
+          {(voiceCall.emergency || assessment?.emergency) && (
             <EmergencyBanner
-              message={assessment.emergency.alertMessage}
+              message={
+                voiceCall.emergency?.alertMessage ??
+                assessment?.emergency?.alertMessage ??
+                ''
+              }
               ctaLabel={t('callStaffNow')}
               onCtaClick={() => {
                 window.alert(t('callStaffInstruction'));
@@ -210,6 +250,34 @@ export function CallPage() {
                 <span aria-hidden="true" className="call-btn-icon">{'\u260E'}</span>
                 {t('callTapToStart')}
               </button>
+            )}
+            {callActive && (
+              <>
+                <button
+                  type="button"
+                  className={`call-btn mute call-btn-mute${voiceCall.muted ? ' is-muted' : ''}`}
+                  onClick={() => voiceCall.toggleMute()}
+                  aria-pressed={voiceCall.muted}
+                >
+                  <span aria-hidden="true" className="call-btn-icon">
+                    {voiceCall.muted ? <MicOffIcon /> : <MicIcon />}
+                  </span>
+                  {voiceCall.muted ? t('callUnmute') : t('callMute')}
+                </button>
+                <button
+                  type="button"
+                  className={`call-btn speaker call-btn-speaker${
+                    voiceCall.speakerEnabled ? '' : ' is-off'
+                  }`}
+                  onClick={() => voiceCall.toggleSpeaker()}
+                  aria-pressed={!voiceCall.speakerEnabled}
+                >
+                  <span aria-hidden="true" className="call-btn-icon">
+                    {voiceCall.speakerEnabled ? <SpeakerOnIcon /> : <SpeakerOffIcon />}
+                  </span>
+                  {voiceCall.speakerEnabled ? t('callSpeakerOff') : t('callSpeakerOn')}
+                </button>
+              </>
             )}
             <button
               type="button"

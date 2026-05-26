@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import perf_counter
-from typing import Any
+from typing import Any, AsyncIterator
 
 import asyncpg
 
@@ -59,7 +59,7 @@ class TriageService:
         # (LINE / FCM / SMS) once those services land.
         self.notifier: BaseNotificationService = notifier or MockNotificationService()
 
-    async def process_chat(
+    async def _prepare_chat_turn(
         self,
         *,
         connection: asyncpg.Connection,
@@ -67,8 +67,17 @@ class TriageService:
         language: str,
         input_mode: str,
         content: str,
-    ) -> tuple[TriageResult, dict[str, Any]]:
-        start = perf_counter()
+    ) -> dict[str, Any]:
+        """Persist the user turn and load the per-turn reference data.
+
+        Runs the synchronous-feeling first half of a chat turn:
+        validates the session, writes the inbound user message, fetches
+        the rule-engine inputs (emergency triggers / routing rules /
+        departments), and returns a context bag the second half
+        (``_finalize_chat_turn``) needs to persist the result. Split out
+        of ``process_chat`` so the streaming variant can share it
+        verbatim without duplicating fragile DB code.
+        """
 
         session_row = await connection.fetchrow(
             "SELECT id, language, metadata FROM sessions WHERE id = $1",
@@ -77,13 +86,6 @@ class TriageService:
         if not session_row:
             raise ValueError("Session not found")
 
-        # Carry triage state across turns. ADK calls ``classify_triage_level``
-        # once (turn the symptoms come in) and ``collect_emergency_contact``
-        # once (turn the last contact field is provided); intermediate turns
-        # emit no tool output. Without this, severity/department/contact all
-        # reset to "unknown" mid-conversation and the EmergencyAgent's
-        # multi-turn name → phone → address handoff never reaches a state
-        # where the notifier can fire with full info.
         prior_metadata: dict[str, Any] = dict(session_row["metadata"] or {})
         prior_classification: dict[str, Any] = (
             prior_metadata.get("triage_classification") or {}
@@ -101,7 +103,9 @@ class TriageService:
             content,
         )
 
-        departments = await connection.fetch("SELECT id, code, name_en, name_th FROM departments WHERE is_active = TRUE")
+        departments = await connection.fetch(
+            "SELECT id, code, name_en, name_th FROM departments WHERE is_active = TRUE"
+        )
         department_by_code = {
             str(record["code"]): {
                 "id": str(record["id"]),
@@ -111,7 +115,9 @@ class TriageService:
             for record in departments
         }
         department_name_by_id = {
-            str(record["id"]): (record["name_th"] if language == "th" and record["name_th"] else record["name_en"])
+            str(record["id"]): (
+                record["name_th"] if language == "th" and record["name_th"] else record["name_en"]
+            )
             for record in departments
         }
 
@@ -137,7 +143,41 @@ class TriageService:
             [dict(item) for item in emergency_triggers],
             language=language,
         )
-        routing_matches = evaluate_routing_rules(content, [dict(item) for item in routing_rules])
+        routing_matches = evaluate_routing_rules(
+            content, [dict(item) for item in routing_rules]
+        )
+
+        await self.adk_runner.ensure_adk_session(session_id, language, input_mode)
+
+        return {
+            "msg_user": msg_user,
+            "prior_metadata": prior_metadata,
+            "prior_classification": prior_classification,
+            "prior_contact": prior_contact,
+            "department_by_code": department_by_code,
+            "department_name_by_id": department_name_by_id,
+            "emergency_matches": emergency_matches,
+            "routing_matches": routing_matches,
+        }
+
+    async def process_chat(
+        self,
+        *,
+        connection: asyncpg.Connection,
+        session_id: str,
+        language: str,
+        input_mode: str,
+        content: str,
+    ) -> tuple[TriageResult, dict[str, Any]]:
+        start = perf_counter()
+
+        ctx = await self._prepare_chat_turn(
+            connection=connection,
+            session_id=session_id,
+            language=language,
+            input_mode=input_mode,
+            content=content,
+        )
 
         # ----------------------------------------------------------------
         # ADK turn. The HotlineADKRunner owns the InMemorySessionService
@@ -146,13 +186,50 @@ class TriageService:
         # agents pick the right reply format (voice = short spoken;
         # text = readable prose).
         # ----------------------------------------------------------------
-        await self.adk_runner.ensure_adk_session(session_id, language, input_mode)
         adk_result = await self.adk_runner.chat(
             session_id=session_id,
             language=language,
             user_message=content,
             input_mode=input_mode,
         )
+
+        return await self._finalize_chat_turn(
+            connection=connection,
+            session_id=session_id,
+            language=language,
+            content=content,
+            start=start,
+            ctx=ctx,
+            adk_result=adk_result,
+        )
+
+    async def _finalize_chat_turn(
+        self,
+        *,
+        connection: asyncpg.Connection,
+        session_id: str,
+        language: str,
+        content: str,
+        start: float,
+        ctx: dict[str, Any],
+        adk_result: dict[str, Any],
+    ) -> tuple[TriageResult, dict[str, Any]]:
+        """Run the post-ADK persistence + rule engine + notification path.
+
+        Identical for streaming and non-streaming callers — they only
+        differ in how they obtain ``adk_result``. Pulled out so we
+        don't drift between the two: any change to severity collapsing,
+        notifier gating, or session-metadata layout lives in one place.
+        """
+
+        msg_user = ctx["msg_user"]
+        prior_metadata = ctx["prior_metadata"]
+        prior_classification = ctx["prior_classification"]
+        prior_contact = ctx["prior_contact"]
+        department_by_code = ctx["department_by_code"]
+        department_name_by_id = ctx["department_name_by_id"]
+        emergency_matches = ctx["emergency_matches"]
+        routing_matches = ctx["routing_matches"]
 
         reply = adk_result["reply"]
         new_classification: dict[str, Any] = adk_result.get("classification", {})
@@ -401,3 +478,166 @@ class TriageService:
             alert_sent=alert_sent,
         )
         return result, dict(msg_assistant)
+
+    async def process_chat_stream(
+        self,
+        *,
+        connection: asyncpg.Connection,
+        session_id: str,
+        language: str,
+        input_mode: str,
+        content: str,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Streaming variant of :meth:`process_chat`.
+
+        Yields a sequence of event dicts that the HTTP layer can relay
+        to the frontend as Server-Sent Events. Mirrors the
+        non-streaming path's persistence + rule-engine + notifier
+        behaviour exactly — same DB writes, same notifier gating, same
+        sticky-state semantics — only the agent text reaches the
+        client incrementally instead of all at once.
+
+        Emitted event types:
+        * ``{"type": "user_message", "message": {...}}`` once the
+          inbound user message is persisted (so the UI can re-render
+          its optimistic bubble with the real DB id + timestamp).
+        * ``{"type": "delta", "text": "..."}`` as the agent streams.
+        * ``{"type": "classified", ...}`` / ``{"type": "contact", ...}``
+          when the respective tool fires.
+        * ``{"type": "complete", "result": {...},
+            "assistant_message": {...}}`` terminal event with the full
+          TriageResult payload (matches the existing /chat response
+          shape) and the freshly-persisted assistant DB row.
+        * ``{"type": "error", "message": "..."}`` on a fatal failure.
+        """
+
+        start = perf_counter()
+
+        try:
+            ctx = await self._prepare_chat_turn(
+                connection=connection,
+                session_id=session_id,
+                language=language,
+                input_mode=input_mode,
+                content=content,
+            )
+        except ValueError as exc:
+            yield {"type": "error", "message": str(exc)}
+            return
+
+        # Echo the persisted user message so the frontend can swap its
+        # optimistic bubble for the real DB row (id, timestamp). The
+        # asyncpg Record is dict-castable; we coerce so JSON encoding
+        # downstream is straightforward.
+        yield {"type": "user_message", "message": dict(ctx["msg_user"])}
+
+        # Consume the ADK stream. We accumulate the reply locally as
+        # we go so that the final ``adk_result`` we feed into
+        # ``_finalize_chat_turn`` has the same shape the non-streaming
+        # path expects, even though the text arrived in deltas.
+        adk_result: dict[str, Any] = {
+            "reply": "",
+            "classification": {},
+            "contact": {},
+            "input_mode": input_mode,
+        }
+        try:
+            async for event in self.adk_runner.chat_stream(
+                session_id=session_id,
+                language=language,
+                user_message=content,
+                input_mode=input_mode,
+            ):
+                event_type = event.get("type")
+                if event_type == "delta":
+                    yield {"type": "delta", "text": event["text"]}
+                elif event_type == "reset":
+                    # Inner LLM call ended in a tool dispatch — its
+                    # deltas were reasoning, not the actual reply.
+                    # Forward so the frontend wipes the bubble and
+                    # the TTS queue can drop already-queued chunks.
+                    yield {"type": "reset"}
+                elif event_type == "classified":
+                    adk_result["classification"] = event["classification"]
+                    yield event
+                elif event_type == "contact":
+                    adk_result["contact"] = event["contact"]
+                    yield event
+                elif event_type == "done":
+                    adk_result["reply"] = event.get("reply", "")
+                    # Refresh classification/contact in case the agent
+                    # tool fired only inside the aggregated final event
+                    # (which we explicitly forward through ``done``).
+                    adk_result["classification"] = (
+                        event.get("classification")
+                        or adk_result["classification"]
+                    )
+                    adk_result["contact"] = (
+                        event.get("contact") or adk_result["contact"]
+                    )
+        except Exception as exc:
+            yield {"type": "error", "message": f"agent_stream_failed: {exc}"}
+            return
+
+        try:
+            result, assistant_message = await self._finalize_chat_turn(
+                connection=connection,
+                session_id=session_id,
+                language=language,
+                content=content,
+                start=start,
+                ctx=ctx,
+                adk_result=adk_result,
+            )
+        except Exception as exc:
+            yield {"type": "error", "message": f"finalize_failed: {exc}"}
+            return
+
+        yield {
+            "type": "complete",
+            "result": _triage_result_to_payload(result),
+            "assistant_message": assistant_message,
+        }
+
+
+def _triage_result_to_payload(result: TriageResult) -> dict[str, Any]:
+    """Coerce :class:`TriageResult` into the same JSON shape the
+    existing ``/sessions/{id}/chat`` REST response uses.
+
+    Keeping the schema identical between streaming and non-streaming
+    means the frontend can re-use its existing ``ChatResponsePayload``
+    parser for the terminal ``complete`` event.
+    """
+
+    return {
+        "reply": result.reply,
+        "severity": {
+            "level": result.severity_level,
+            "explanation": result.severity_explanation,
+            "confidence": result.severity_confidence,
+        },
+        "department": (
+            {
+                "department_id": result.department_id,
+                "reason": result.department_reason,
+                "confidence": result.department_confidence,
+            }
+            if result.department_id
+            else None
+        ),
+        "emergency": (
+            {
+                "trigger_id": result.emergency_trigger_id,
+                "alert_message": result.emergency_alert_message,
+                "detected_symptoms": result.detected_symptoms,
+            }
+            if result.emergency_trigger_id or result.emergency_alert_message
+            else None
+        ),
+        "symptoms": None,
+        "follow_up_question": result.follow_up_question,
+        "follow_up_reason": result.follow_up_reason,
+        "alert_sent": result.alert_sent,
+        "model_name": result.model_name,
+        "latency_ms": result.latency_ms,
+    }

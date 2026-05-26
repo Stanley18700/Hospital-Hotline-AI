@@ -1,15 +1,32 @@
+import asyncio
+import json
+import logging
 from contextlib import asynccontextmanager
 from uuid import UUID
 import asyncpg
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from app.config import settings
 from app.database import create_pool, get_connection, record_to_dict, records_to_dicts
 from app.services import TriageService
 from app.services.google_stt import GoogleSttClient
 from app.services.google_tts import GoogleTtsClient
+from app.services.live_voice_service import LiveVoiceService
 from app.services.notification_service import MockNotificationService
+
+logger = logging.getLogger(__name__)
 from app.schemas import (
     ChatRequest,
     ChatResponse,
@@ -41,6 +58,12 @@ async def lifespan(app: FastAPI):
     app.state.triage_service = TriageService(notifier=notifier)
     app.state.tts_client = GoogleTtsClient()
     app.state.stt_client = GoogleSttClient()
+    # Gemini Live API bridge — owns the per-call WebSocket state for
+    # voice mode. Reuses the same TriageService so emergency dispatch
+    # paths through MockNotificationService stay identical to text.
+    app.state.live_voice_service = LiveVoiceService(
+        triage_service=app.state.triage_service
+    )
     try:
         yield
     finally:
@@ -205,6 +228,71 @@ async def chat(
         alert_sent=result.alert_sent,
         assistant_message_id=assistant_message.get("id"),
     )
+
+@app.post("/sessions/{session_id}/chat/stream")
+async def chat_stream(
+    session_id: UUID,
+    payload: ChatRequest,
+    request: Request,
+):
+    """Server-Sent Events variant of :func:`chat`.
+
+    Streams the agent's response back to the client incrementally so
+    the UI can render tokens as they arrive (typewriter effect) and
+    kick off per-sentence TTS before the model finishes generating.
+    Persistence, rule-engine overrides, and notifier dispatch run
+    exactly as in the non-streaming path — only the transport differs.
+
+    The stream emits NDJSON frames inside an SSE ``data:`` line so the
+    browser ``EventSource`` (or a fetch + ReadableStream consumer) can
+    parse each event with a single ``JSON.parse``. Frame schema is
+    defined by :meth:`TriageService.process_chat_stream` (look there
+    for the authoritative type list).
+
+    Note we acquire the DB connection INSIDE the generator (rather
+    than via ``Depends(get_connection)``) because FastAPI releases the
+    dependency connection back to the pool the moment the route
+    function returns — and for a StreamingResponse, that happens
+    before the generator runs. Acquiring inside keeps the connection
+    held for the lifetime of the stream.
+    """
+
+    triage_service: TriageService = request.app.state.triage_service
+    pool: asyncpg.Pool = request.app.state.db_pool
+
+    async def event_generator():
+        async with pool.acquire() as connection:
+            try:
+                async for event in triage_service.process_chat_stream(
+                    connection=connection,
+                    session_id=str(session_id),
+                    language=payload.language,
+                    input_mode=payload.input_mode,
+                    content=payload.content,
+                ):
+                    # SSE framing — one JSON payload per ``data:`` line,
+                    # terminated by a blank line. We use ``default=str``
+                    # so asyncpg datetimes / UUIDs (which appear in the
+                    # ``user_message`` and ``assistant_message`` events)
+                    # serialize without an extra coercion step.
+                    yield f"data: {json.dumps(event, default=str)}\n\n"
+            except Exception as exc:
+                logger.exception("chat_stream failed for session %s", session_id)
+                yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            # Disable any intermediate buffering so each frame reaches
+            # the client immediately — nginx in particular adds 4 KB
+            # of buffering by default which would batch our deltas.
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
 
 @app.post("/sessions/{session_id}/symptoms", status_code=status.HTTP_201_CREATED)
 async def create_symptom_entry(session_id: UUID, payload: SymptomEntryCreate, connection: asyncpg.Connection = Depends(get_connection)):
@@ -458,3 +546,191 @@ async def conversation_summary(connection: asyncpg.Connection = Depends(get_conn
         """
     )
     return records_to_dicts(records)
+
+
+# ---------------------------------------------------------------------------
+# Voice WebSocket — Gemini Live API bridge
+# ---------------------------------------------------------------------------
+#
+# Protocol (see app/services/live_voice_service.py for state details):
+#
+#   Client → server
+#     bytes                          raw PCM 16-bit 16 kHz mono audio chunk
+#     {"type": "mute"}               suppress mic forward to the live pipeline
+#     {"type": "unmute"}             resume forwarding
+#     {"type": "end_of_turn"}        soft hint, currently a no-op
+#     {"type": "end_call"}           caller hung up — close gracefully
+#
+#   Server → client
+#     bytes                          raw PCM agent audio (24 kHz mono)
+#     {"type": "status", "muted":…}  ack for mute / unmute
+#     {"type": "call_ended"}         sent right before the socket closes
+#     {"type": "error",   "message"} fatal error before close
+#
+# The endpoint runs two tasks concurrently: one drives ADK's bidirectional
+# stream and forwards audio to the browser, the other listens for inbound
+# audio + control messages. When either task finishes (clean disconnect,
+# explicit end_call, or a crash) we cancel the sibling task and run
+# disconnect() — which flushes the accumulated transcript through the
+# normal text triage pipeline so DB rows and the mock notifier still fire.
+
+
+@app.websocket("/ws/voice/{session_id}")
+async def voice_call(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+    pool: asyncpg.Pool = websocket.app.state.db_pool
+    live_voice_service: LiveVoiceService = websocket.app.state.live_voice_service
+    language = websocket.query_params.get("language", "en")
+
+    # Callbacks forward live transcripts + emergency banner triggers from
+    # the ADK event loop to the frontend over the WS. ``send_*`` may
+    # raise if the client closed the socket mid-send; swallow those so a
+    # disconnect race doesn't crash the pipeline.
+    async def push_transcript(role: str, text: str) -> None:
+        try:
+            await websocket.send_json(
+                {"type": "transcript", "role": role, "text": text}
+            )
+        except Exception:
+            logger.debug(
+                "Failed to push transcript to %s (likely client closed)",
+                session_id,
+            )
+
+    async def push_emergency(payload: dict) -> None:
+        try:
+            await websocket.send_json({"type": "emergency", **payload})
+        except Exception:
+            logger.debug(
+                "Failed to push emergency to %s (likely client closed)",
+                session_id,
+            )
+
+    async with pool.acquire() as conn:
+        try:
+            await live_voice_service.connect(
+                session_id,
+                language,
+                conn,
+                transcript_callback=push_transcript,
+                emergency_callback=push_emergency,
+            )
+        except ValueError as exc:
+            await websocket.close(code=1008, reason=str(exc))
+            return
+        except Exception:
+            logger.exception("Voice connect failed for %s", session_id)
+            try:
+                await websocket.send_json({"type": "error", "message": "connect_failed"})
+            finally:
+                await websocket.close(code=1011)
+            return
+
+        async def pump_outbound() -> None:
+            """ADK live pipeline → WebSocket audio frames."""
+            try:
+                async for chunk in live_voice_service.run_live_pipeline(session_id):
+                    if chunk:
+                        await websocket.send_bytes(chunk)
+            except WebSocketDisconnect:
+                # Client closed mid-stream; cancellation will tear down
+                # the receive task as well.
+                pass
+            except Exception:
+                logger.exception(
+                    "Outbound voice pump failed for %s", session_id
+                )
+
+        async def pump_inbound() -> None:
+            """WebSocket frames → ADK live queue / control plane."""
+            while True:
+                try:
+                    message = await websocket.receive()
+                except WebSocketDisconnect:
+                    return
+
+                # FastAPI / Starlette gives us either bytes or text in
+                # ``message``. Binary is microphone PCM; text is a JSON
+                # control envelope. ``message["type"]`` is the wire
+                # event (e.g. "websocket.disconnect") — not our payload
+                # type — so disambiguate by key.
+                if message.get("type") == "websocket.disconnect":
+                    return
+
+                if (data := message.get("bytes")) is not None:
+                    try:
+                        await live_voice_service.send_audio(session_id, data)
+                    except ValueError:
+                        # Session vanished — bail. The outer cleanup will
+                        # close the socket.
+                        return
+                    except Exception:
+                        logger.exception(
+                            "send_audio failed for %s", session_id
+                        )
+                    continue
+
+                text = message.get("text")
+                if text is None:
+                    continue
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Voice WS %s: discarding non-JSON text frame", session_id
+                    )
+                    continue
+
+                msg_type = payload.get("type") if isinstance(payload, dict) else None
+                if msg_type == "mute":
+                    live_voice_service.set_mute(session_id, True)
+                    await websocket.send_json({"type": "status", "muted": True})
+                elif msg_type == "unmute":
+                    live_voice_service.set_mute(session_id, False)
+                    await websocket.send_json({"type": "status", "muted": False})
+                elif msg_type == "end_of_turn":
+                    # ADK's voice activity detection handles turn-end on
+                    # its own; the hint is here so the frontend can also
+                    # call send_activity_end in the future if needed.
+                    continue
+                elif msg_type == "end_call":
+                    return
+                else:
+                    logger.debug(
+                        "Voice WS %s: unknown control message %r",
+                        session_id,
+                        msg_type,
+                    )
+
+        outbound_task = asyncio.create_task(pump_outbound())
+        inbound_task = asyncio.create_task(pump_inbound())
+        try:
+            done, pending = await asyncio.wait(
+                {outbound_task, inbound_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            # Surface any unexpected task exceptions to the log without
+            # raising — disconnect() must still run.
+            for task in done:
+                exc = task.exception()
+                if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                    logger.exception(
+                        "Voice WS %s task crashed", session_id, exc_info=exc
+                    )
+            # Wait briefly for cancellations so disconnect() sees no
+            # in-flight ADK iteration when it closes the queue.
+            await asyncio.gather(*pending, return_exceptions=True)
+        finally:
+            await live_voice_service.disconnect(session_id)
+            try:
+                await websocket.send_json({"type": "call_ended"})
+            except Exception:
+                # Socket already closed by the client — fine.
+                pass
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+            logger.info("Voice call ended: %s", session_id)

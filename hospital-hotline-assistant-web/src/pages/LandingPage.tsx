@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { api } from '../api';
 import { Layout } from '../components/Layout';
 import { useLanguage, useSessionStorage } from '../hooks/useSession';
+import { prewarmVoiceCall } from '../hooks/voicePrewarm';
 
 function PhoneIcon() {
   return (
@@ -32,6 +33,21 @@ export function LandingPage() {
   const startSession = async (mode: 'call' | 'chat') => {
     setStartingMode(mode);
     setError(null);
+
+    // If a voice call is imminent, kick off mic-permission + playback
+    // context warmup in parallel with session creation. The browser's
+    // mic permission prompt is by far the slowest single step on a cold
+    // call (200 ms - 2 s+); doing it here means the prompt is already
+    // resolved by the time the user reaches the call page, and the
+    // first `getUserMedia` inside `useVoiceCall.start()` returns
+    // instantly. We do NOT await this — session creation runs in
+    // parallel so the overall click-to-call-page time is shaped by
+    // whichever finishes last (typically the permission prompt the
+    // first time, the session POST every other time).
+    if (mode === 'call') {
+      void prewarmVoiceCall();
+    }
+
     try {
       const session = await api.createSession({
         language,

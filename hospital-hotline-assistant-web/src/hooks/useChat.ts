@@ -82,13 +82,44 @@ function toAssessment(
   };
 }
 
+export interface StreamingTurn {
+  /** Optimistic user message (synthetic id until the server confirms). */
+  userMessage: MessageOut;
+  /** Live-updating assistant text accumulated from delta events. */
+  assistantText: string;
+  /** True once the server has emitted ``complete`` or ``error``. */
+  done: boolean;
+  /** Non-null only on ``error`` frames. */
+  error: string | null;
+}
+
+export interface SendStreamCallbacks {
+  /** Fired for every delta frame — useful for sentence-boundary TTS. */
+  onDelta?: (chunk: string, full: string) => void;
+  /**
+   * Fired when the backend tells us a chunk we previously streamed
+   * was actually pre-tool-call reasoning from one of the inner LLM
+   * calls (Orchestrator routing, agent thinking before a tool
+   * dispatch). The UI should wipe the assistant bubble and the TTS
+   * queue so the next batch of deltas — the real reply — replaces
+   * the discarded thinking.
+   */
+  onReset?: () => void;
+  /** Fired exactly once when the server finishes the turn. */
+  onComplete?: (response: ChatResponsePayload, assessment: ChatAssessment) => void;
+  /** Fired on transport / server-reported errors. */
+  onError?: (message: string) => void;
+}
+
 export function useChat(sessionId: string | null, language: AppLanguage) {
   const [messages, setMessages] = useState<MessageOut[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [assessment, setAssessment] = useState<ChatAssessment | null>(null);
+  const [streamingTurn, setStreamingTurn] = useState<StreamingTurn | null>(null);
   const departmentsRef = useRef<Map<string, string>>(new Map());
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     setMessages([]);
@@ -160,14 +191,190 @@ export function useChat(sessionId: string | null, language: AppLanguage) {
     [sessionId, isSending, language, loadMessages],
   );
 
+  const sendMessageStream = useCallback(
+    async (
+      content: string,
+      inputMode: InputMode = 'text',
+      callbacks: SendStreamCallbacks = {},
+    ) => {
+      if (!sessionId || !content.trim() || isSending) return null;
+
+      setIsSending(true);
+      setError(null);
+
+      // Cancel any prior in-flight stream (e.g. user spammed Enter).
+      // Without this we'd race two SSE readers against each other and
+      // the older one would happily keep pushing deltas into the
+      // newer turn's UI bubble.
+      if (abortRef.current) {
+        abortRef.current.abort();
+      }
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      // Optimistic user bubble. We use a synthetic id prefixed with
+      // "optim_" so the UI can distinguish it from server-confirmed
+      // ones, but it carries the same MessageOut shape so the
+      // existing renderers don't need branching. Once the server's
+      // first ``user_message`` frame arrives we swap this id for the
+      // real DB row's id (and timestamp).
+      const trimmed = content.trim();
+      const optimistic: MessageOut = {
+        id: `optim_${Date.now()}`,
+        session_id: sessionId,
+        role: 'user',
+        input_mode: inputMode,
+        content: trimmed,
+        created_at: new Date().toISOString(),
+      };
+
+      // Seed the streaming turn so the UI immediately shows the user
+      // bubble + an empty assistant bubble. We append the optimistic
+      // message into the rendered list right away (the assistant
+      // bubble is rendered separately from ``streamingTurn`` so it
+      // can live-update without re-rendering the message list).
+      setMessages((prev) => [...prev, optimistic]);
+      setStreamingTurn({
+        userMessage: optimistic,
+        assistantText: '',
+        done: false,
+        error: null,
+      });
+
+      let accumulated = '';
+      let serverUserMessageId: string | null = null;
+
+      try {
+        for await (const event of api.chatStream(
+          sessionId,
+          {
+            content: trimmed,
+            input_mode: inputMode,
+            language,
+            history: [],
+          },
+          controller.signal,
+        )) {
+          if (event.type === 'user_message') {
+            serverUserMessageId = event.message.id;
+            // Swap the optimistic id for the real DB id so any future
+            // operations (edit / delete / message references) work.
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === optimistic.id ? { ...event.message } : m,
+              ),
+            );
+          } else if (event.type === 'delta') {
+            accumulated += event.text;
+            setStreamingTurn((prev) =>
+              prev ? { ...prev, assistantText: accumulated } : prev,
+            );
+            callbacks.onDelta?.(event.text, accumulated);
+          } else if (event.type === 'reset') {
+            // Backend signal: the chunks we just streamed were
+            // pre-tool-call thinking from one of the orchestrator's
+            // inner LLM calls, not the real reply. Drop everything
+            // so the bubble (and TTS queue) start clean on the next
+            // delta batch.
+            accumulated = '';
+            setStreamingTurn((prev) =>
+              prev ? { ...prev, assistantText: '' } : prev,
+            );
+            callbacks.onReset?.();
+          } else if (event.type === 'complete') {
+            const response = event.result;
+            if (departmentsRef.current.size === 0) {
+              try {
+                const departments = await api.listDepartments();
+                departmentsRef.current = new Map(
+                  departments.map((d) => [
+                    d.id,
+                    language === 'th' ? d.name_th ?? d.name_en : d.name_en,
+                  ]),
+                );
+              } catch {
+                // non-fatal
+              }
+            }
+            const nextAssessment = toAssessment(response, departmentsRef.current);
+            setAssessment(nextAssessment);
+
+            // Append the assistant message to the rendered list. We
+            // dedupe in case loadMessages races us — the DB row's id
+            // is the source of truth.
+            setMessages((prev) => {
+              if (prev.some((m) => m.id === event.assistant_message.id)) {
+                return prev;
+              }
+              return [...prev, event.assistant_message];
+            });
+            setStreamingTurn((prev) =>
+              prev
+                ? { ...prev, assistantText: response.reply, done: true }
+                : prev,
+            );
+            callbacks.onComplete?.(response, nextAssessment);
+            return {
+              response,
+              assessment: nextAssessment,
+              userMessageId: serverUserMessageId,
+            };
+          } else if (event.type === 'error') {
+            setError(event.message);
+            setStreamingTurn((prev) =>
+              prev ? { ...prev, done: true, error: event.message } : prev,
+            );
+            callbacks.onError?.(event.message);
+            return null;
+          }
+        }
+        // Stream ended without a ``complete`` frame — surface as an error.
+        const msg = 'Stream ended unexpectedly';
+        setError(msg);
+        setStreamingTurn((prev) =>
+          prev ? { ...prev, done: true, error: msg } : prev,
+        );
+        callbacks.onError?.(msg);
+        return null;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          return null;
+        }
+        const message = err instanceof Error ? err.message : 'Failed to send message';
+        setError(message);
+        setStreamingTurn((prev) =>
+          prev ? { ...prev, done: true, error: message } : prev,
+        );
+        callbacks.onError?.(message);
+        return null;
+      } finally {
+        setIsSending(false);
+        if (abortRef.current === controller) {
+          abortRef.current = null;
+        }
+      }
+    },
+    [sessionId, isSending, language],
+  );
+
+  // Tear down any in-flight stream when the hook unmounts (e.g. user
+  // navigates back to the landing page mid-response).
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
+
   return {
     messages,
     isLoading,
     isSending,
     error,
     assessment,
+    streamingTurn,
     loadMessages,
     sendMessage,
+    sendMessageStream,
     setAssessment,
   };
 }

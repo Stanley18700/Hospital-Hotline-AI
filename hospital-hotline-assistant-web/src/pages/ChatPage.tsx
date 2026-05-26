@@ -26,8 +26,10 @@ export function ChatPage() {
     isSending,
     error,
     assessment,
+    streamingTurn,
     loadMessages,
     sendMessage,
+    sendMessageStream,
   } = useChat(sessionId, language);
 
   const speech = useSpeechRecognition(language);
@@ -35,8 +37,12 @@ export function ChatPage() {
   const frontdeskMode = (import.meta.env.VITE_FRONTDESK_MODE ?? 'false') === 'true';
 
   const voiceCall = useVoiceCall({
+    sessionId,
     language,
     onTranscript: async (transcript) => {
+      // The voice-call legacy path still uses non-streaming chat —
+      // streaming only makes sense for the typed/text input. Voice
+      // input goes through Gemini Live's own audio response instead.
       const result = await sendMessage(transcript, 'voice');
       return result?.response.reply ?? null;
     },
@@ -51,7 +57,7 @@ export function ChatPage() {
 
   useEffect(() => {
     return () => {
-      voiceCall.end();
+      void voiceCall.end();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -66,7 +72,7 @@ export function ChatPage() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isSending]);
+  }, [messages, isSending, streamingTurn?.assistantText, streamingTurn?.done]);
 
   const handleSend = async (overrideText?: string, inputMode: 'voice' | 'text' = 'text') => {
     const text = (overrideText ?? input).trim();
@@ -75,15 +81,45 @@ export function ChatPage() {
     if (!overrideText) {
       setInput('');
     }
-    const result = await sendMessage(text, inputMode);
-    if (result?.response.reply && !callActive) {
-      void synthesis.speak(result.response.reply);
+
+    // Voice-input turns route through the existing non-streaming path
+    // because the live voice call has its own audio response stream
+    // and we don't want to TTS the typed reply on top of that.
+    if (inputMode === 'voice' || callActive) {
+      const result = await sendMessage(text, inputMode);
+      if (result?.response.reply && !callActive) {
+        void synthesis.speak(result.response.reply);
+      }
+      return;
     }
+
+    // Streaming text turn: the user message renders optimistically as
+    // soon as we kick off, the assistant bubble fills in via delta
+    // events, and TTS — when enabled — plays sentence by sentence.
+    synthesis.stop();
+    await sendMessageStream(text, 'text', {
+      onDelta: (chunk) => {
+        // Sentence-boundary TTS so audio plays alongside the typewriter
+        // text. When the speaker is off this is a no-op inside the hook.
+        synthesis.speakStreamChunk(chunk);
+      },
+      onReset: () => {
+        // The deltas we already enqueued for TTS were inner-LLM
+        // reasoning (e.g. the orchestrator's "Hello, I can help"
+        // before it transfers to TriageAgent). Stop any in-flight
+        // playback + queued audio so the user doesn't hear the
+        // discarded thinking on top of the real reply.
+        synthesis.stop();
+      },
+      onComplete: () => {
+        synthesis.flushStream();
+      },
+    });
   };
 
   const handleToggleCall = () => {
     if (callActive) {
-      voiceCall.end();
+      void voiceCall.end();
     } else {
       synthesis.stop();
       void voiceCall.start();
@@ -267,13 +303,34 @@ export function ChatPage() {
 
         <div className="chat-messages">
           {isLoading && <p className="muted">{t('loading')}</p>}
-          {!isLoading && messages.length === 0 && (
+          {!isLoading && messages.length === 0 && !streamingTurn && (
             <p className="muted">{t('noMessages')}</p>
           )}
           {messages.map((message) => (
             <MessageBubble key={message.id} message={message} />
           ))}
-          <TypingIndicator visible={isSending} />
+          {/* Live streaming assistant bubble. Rendered ONLY while a
+              turn is in flight — once the ``complete`` event arrives,
+              the assistant message is appended to ``messages`` and
+              ``streamingTurn`` is cleared so this collapses cleanly
+              without a flicker. The empty-text case still shows the
+              bubble (with a typing indicator inside) so the user has
+              immediate feedback that their message was received. */}
+          {streamingTurn && !streamingTurn.done && (
+            <div className="message-bubble assistant streaming">
+              <div className="message-meta">
+                <span className="message-role">{t('assistant')}</span>
+              </div>
+              {streamingTurn.assistantText ? (
+                <p className="message-content">
+                  {streamingTurn.assistantText}
+                  <span className="streaming-cursor" aria-hidden="true">▍</span>
+                </p>
+              ) : (
+                <TypingIndicator visible={true} />
+              )}
+            </div>
+          )}
           <div ref={messagesEndRef} />
         </div>
 

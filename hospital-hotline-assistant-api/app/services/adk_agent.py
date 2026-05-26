@@ -12,7 +12,8 @@ import json
 import logging
 import os
 import pathlib
-from typing import Any
+import re
+from typing import Any, AsyncIterator
 
 from app.config import settings
 
@@ -38,6 +39,36 @@ from google.adk.runners import Runner  # noqa: E402
 from google.adk.sessions import InMemorySessionService  # noqa: E402
 from google.adk.tools import FunctionTool  # noqa: E402
 from google.genai import types as genai_types  # noqa: E402
+
+
+# Defensive belt-and-suspenders: even with the prompt explicitly forbidding
+# it, Gemini sometimes echoes the `[MODE: ...]` / `[LANG: ...]` / `[CALL_START]`
+# markers we inject onto user messages. Strip any leading run of such
+# bracketed stage directions (and surrounding whitespace) from agent
+# replies before they reach the caller / TTS layer.
+_META_PREFIX_TOKEN_RE = re.compile(
+    r"^\s*\[\s*(?:MODE|LANG|CALL_START)\b[^\]]*\]\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_meta_markers(reply: str) -> str:
+    """Remove any leading ``[MODE: ...]`` / ``[LANG: ...]`` / ``[CALL_START]``
+    markers the model may have echoed back from the user-message envelope.
+
+    We only strip from the front (and only those three specific labels) so
+    that legitimate caller-facing brackets in the middle of an answer
+    (e.g. "[Bangkok General]") aren't touched.
+    """
+
+    if not reply:
+        return reply
+    while True:
+        stripped = _META_PREFIX_TOKEN_RE.sub("", reply, count=1)
+        if stripped == reply:
+            break
+        reply = stripped
+    return reply.lstrip()
 
 
 """
@@ -210,10 +241,27 @@ WORKFLOW
    - Step 4: Are danger-zone vitals present? Yes → upgrade to Level 2.
      No → Level 3.
 4. If important information is missing, ask ONE focused follow-up question
-   per turn until a triage can be identified.
-   - Level 1 (Red / Immediate): NO follow-ups. Classify immediately. Tell
-     the patient to stay calm and that emergency help is being dispatched.
-   - Level 2 (Orange / Emergent): at most 1 follow-up before classifying.
+   per turn until a triage can be identified. The exact number of
+   follow-ups required depends on the apparent acuity of the case:
+   - Level 1 (Red / Immediate, e.g. cardiac arrest, unresponsive, severe
+     trauma): NO follow-ups. Classify immediately and reassure the
+     caller that emergency help is being dispatched.
+   - Level 2 (Orange / Emergent, e.g. active chest pain, signs of
+     stroke, severe pain, suicidal): at most 1 focused follow-up
+     before classifying.
+   - Level 3 / 4 / 5 (anything that does NOT immediately match the
+     Level 1 or Level 2 examples in the reference): ask AT LEAST 2–3
+     targeted clarifying questions BEFORE classifying. A single
+     symptom (e.g. just "I have a cough", "I have a headache",
+     "my stomach hurts") is NOT enough to pick a level — you need to
+     understand duration, severity, associated symptoms, vital sign
+     red flags (fever, breathing difficulty, dizziness, vomiting,
+     etc.), and any pre-existing conditions. Ask one question per
+     turn, briefly, in a calm tone. Only call `classify_triage_level`
+     once you have a plausible picture of the patient's situation.
+   - Never classify on the very first turn unless the message itself
+     contains an obvious Level 1 or Level 2 trigger from the
+     reference's `examples` list.
 5. Call `get_department_list` to confirm the correct department code before
    classifying.
 6. Call `classify_triage_level` with the final decision. For Level 1 and
@@ -249,6 +297,17 @@ Check the [MODE:] prefix in each user message.
   No bullet points, no markdown, no lists, no emoji.
 - [MODE: text]: Clear readable prose. May use line breaks between thoughts.
   No markdown headers, no heavy formatting.
+
+CRITICAL — DO NOT ECHO META MARKERS
+-----------------------------------
+The `[MODE: ...]` and `[LANG: ...]` lines on user messages are INSTRUCTIONS
+addressed to you, not content you should repeat. Your reply must NEVER
+begin with (or contain anywhere) any text that looks like `[MODE: ...]`,
+`[LANG: ...]`, `[CALL_START]`, square-bracketed labels, or stage
+directions. Start directly with what you want to say to the caller, in
+plain natural language. If you ever feel inclined to write `[MODE:`,
+stop — the caller never sees those markers and including them breaks
+the user interface.
 """
 
 
@@ -310,6 +369,13 @@ message contains other-language tokens (e.g. a Thai-script address in an
 English session — keep your reply in English). Never mix languages in one
 reply. One or two short sentences per turn is ideal regardless of the
 [MODE:] prefix.
+
+CRITICAL — DO NOT ECHO META MARKERS
+-----------------------------------
+The `[MODE: ...]` and `[LANG: ...]` lines on user messages are INSTRUCTIONS
+addressed to you. Your reply must NEVER contain `[MODE: ...]`,
+`[LANG: ...]`, `[CALL_START]`, or any other square-bracketed stage
+direction. Begin directly with what you want to say to the caller.
 """
 
 
@@ -352,7 +418,11 @@ APP_NAME: str = "hospital-hotline"
 _SESSION_SERVICE: InMemorySessionService = InMemorySessionService()
 
 
-def _build_triage_agent() -> LlmAgent:
+def _build_triage_agent(model_name: str | None = None) -> LlmAgent:
+    # ``model_name`` is optional so existing callers (HotlineADKRunner) keep
+    # binding to ``settings.google_model_name`` (Pro tier, text). The live
+    # runner passes ``settings.google_live_model_name`` because the Live API
+    # only accepts its own dedicated model family.
     return LlmAgent(
         name="TriageAgent",
         description=(
@@ -360,7 +430,7 @@ def _build_triage_agent() -> LlmAgent:
             "follow-up questions, consults the decision tree, then records "
             "the final level + department via classify_triage_level."
         ),
-        model=settings.google_model_name,
+        model=model_name or settings.google_model_name,
         instruction=_TRIAGE_INSTRUCTION,
         tools=[
             FunctionTool(get_triage_reference),
@@ -370,7 +440,7 @@ def _build_triage_agent() -> LlmAgent:
     )
 
 
-def _build_emergency_agent() -> LlmAgent:
+def _build_emergency_agent(model_name: str | None = None) -> LlmAgent:
     return LlmAgent(
         name="EmergencyAgent",
         description=(
@@ -378,14 +448,16 @@ def _build_emergency_agent() -> LlmAgent:
             "ambulance dispatch. Activated only after the TriageAgent has "
             "classified the case with needs_emergency_contact=True."
         ),
-        model=settings.google_model_name,
+        model=model_name or settings.google_model_name,
         instruction=_EMERGENCY_INSTRUCTION,
         tools=[FunctionTool(collect_emergency_contact)],
     )
 
 
 def _build_orchestrator(
-    triage_agent: LlmAgent, emergency_agent: LlmAgent
+    triage_agent: LlmAgent,
+    emergency_agent: LlmAgent,
+    model_name: str | None = None,
 ) -> LlmAgent:
     return LlmAgent(
         name="HotlineOrchestrator",
@@ -393,7 +465,7 @@ def _build_orchestrator(
             "Routes hotline turns between the TriageAgent (symptom triage) "
             "and the EmergencyAgent (contact collection for dispatch)."
         ),
-        model=settings.google_model_name,
+        model=model_name or settings.google_model_name,
         instruction=_ORCHESTRATOR_INSTRUCTION,
         sub_agents=[triage_agent, emergency_agent],
     )
@@ -555,7 +627,7 @@ class HotlineADKRunner:
             )
             # Fall through with empty reply so the fallback below kicks in.
 
-        reply = "".join(reply_chunks).strip()
+        reply = _strip_meta_markers("".join(reply_chunks).strip())
 
         # Step 5 — language- and mode-aware fallback when the agent
         # produced no text (e.g. delegated indefinitely, model error,
@@ -582,3 +654,383 @@ class HotlineADKRunner:
             "contact": contact,
             "input_mode": input_mode,
         }
+
+    async def chat_stream(
+        self,
+        session_id: str,
+        language: str,
+        user_message: str,
+        input_mode: str,
+    ) -> "AsyncIterator[dict[str, Any]]":
+        """Streaming variant of :meth:`chat`.
+
+        Yields a sequence of small event dicts as the agent generates,
+        designed to be relayed to the frontend as Server-Sent Events.
+        Event shapes (all carry a ``type`` field):
+
+        * ``{"type": "delta", "text": "..."}`` — a partial text fragment
+          from the ongoing model response. Frontend appends these to a
+          live assistant bubble.
+        * ``{"type": "reset"}`` — a previously-streamed chunk turned
+          out to be pre-tool-call thinking from one of the inner LLM
+          calls (Orchestrator routing, agent reasoning before a tool
+          dispatch). Frontend should wipe the assistant bubble and the
+          TTS queue, then resume appending future deltas.
+        * ``{"type": "classified", "classification": {...}}`` — fired
+          the moment the agent invokes ``classify_triage_level``. The
+          payload mirrors what the tool returned.
+        * ``{"type": "contact", "contact": {...}}`` — fired when the
+          EmergencyAgent submits ``collect_emergency_contact``.
+        * ``{"type": "done", "reply": "...", "classification": {...},
+          "contact": {...}, "input_mode": "..."}`` — terminal event with
+          the fully-assembled reply and tool outputs, ready for
+          ``triage_service`` to persist and run the rule engine /
+          notifier pipeline against.
+
+        Uses ADK's ``StreamingMode.SSE`` so the runner emits partial
+        events as Gemini produces tokens, plus an aggregated final
+        event per LLM call. With our multi-agent setup (Orchestrator
+        → TriageAgent / EmergencyAgent, each of which can fire
+        multiple tool calls), one user turn can trigger 2–4 LLM calls
+        — and Gemini's 2.5 family likes to emit reasoning text
+        *alongside* every function_call it makes. If we naively
+        forwarded all partial text the caller would see 3–4
+        paraphrased greetings stitched together.
+
+        The dedupe rule: stream partials as deltas, but when a
+        non-partial aggregated event arrives, inspect its content. If
+        that LLM call ended in a ``function_call`` / ``transfer_to_agent``,
+        the deltas we just streamed were *pre-tool-call thinking* —
+        emit a ``reset`` so the frontend (and TTS queue) wipes the
+        bubble and starts fresh on the next LLM call's partials. Only
+        the final LLM call (text-only aggregated event) survives.
+        """
+
+        from google.adk.agents.run_config import (  # local import — load cost
+            RunConfig,
+            StreamingMode,
+        )
+
+        await self.ensure_adk_session(session_id, language, input_mode)
+
+        lang_code = language if language in {"en", "th"} else "en"
+        lang_name = "English" if lang_code == "en" else "Thai"
+        if input_mode == "voice":
+            mode_line = (
+                "[MODE: voice — reply in short spoken sentences, no formatting]"
+            )
+        else:
+            mode_line = (
+                "[MODE: text — reply in clear readable prose, light formatting ok]"
+            )
+        lang_line = (
+            f"[LANG: {lang_code} — reply EXCLUSIVELY in {lang_name}. "
+            f"This is the session language and it does not change. Even if "
+            f"the caller writes in another language this turn, your reply "
+            f"MUST be in {lang_name}.]"
+        )
+        final_content = f"{mode_line}\n{lang_line}\n{user_message}"
+
+        content = genai_types.Content(
+            role="user",
+            parts=[genai_types.Part(text=final_content)],
+        )
+
+        run_config = RunConfig(streaming_mode=StreamingMode.SSE)
+
+        # The text in ``current_run_chunks`` belongs to the LLM call
+        # whose aggregated event hasn't arrived yet. If that aggregated
+        # event ends in a function_call we discard the chunks (and ask
+        # the frontend to reset). If it ends in just text we keep them
+        # as the canonical reply so far.
+        kept_chunks: list[str] = []
+        current_run_chunks: list[str] = []
+        classification: dict[str, Any] = {}
+        contact: dict[str, Any] = {}
+
+        # Tracks whether we've already stripped the meta-marker prefix
+        # from the streaming output. The model occasionally echoes
+        # ``[MODE: text][LANG: en]`` at the very start of its first
+        # streamed chunk; we only need to clean the leading bytes once.
+        prefix_cleaned = False
+
+        try:
+            async for event in self._runner.run_async(
+                user_id=session_id,
+                session_id=session_id,
+                new_message=content,
+                run_config=run_config,
+            ):
+                event_content = getattr(event, "content", None)
+                parts = getattr(event_content, "parts", None) or []
+                is_partial = bool(getattr(event, "partial", False))
+
+                # Inspect this event for tool-call / tool-response
+                # signals BEFORE handling text. ``has_function_call``
+                # tells us this LLM call ended in a tool dispatch
+                # (so its text was reasoning, not the final reply).
+                has_function_call = any(
+                    getattr(p, "function_call", None) is not None for p in parts
+                )
+
+                for part in parts:
+                    func_response = getattr(part, "function_response", None)
+                    response_payload = (
+                        getattr(func_response, "response", None)
+                        if func_response is not None
+                        else None
+                    )
+                    if isinstance(response_payload, dict):
+                        if response_payload.get("classified") is True:
+                            classification = dict(response_payload)
+                            yield {
+                                "type": "classified",
+                                "classification": classification,
+                            }
+                        if response_payload.get("contact_collected") is True:
+                            contact = dict(response_payload)
+                            yield {"type": "contact", "contact": contact}
+
+                if is_partial:
+                    # Stream text deltas as they arrive. We can't yet
+                    # tell whether this LLM call will end in a tool
+                    # dispatch (thinking) or plain text (final reply),
+                    # so we forward eagerly for the typewriter effect
+                    # and reconcile on the aggregated event below.
+                    for part in parts:
+                        text = getattr(part, "text", None)
+                        if not text:
+                            continue
+                        chunk = str(text)
+                        if not prefix_cleaned:
+                            chunk = _strip_meta_markers(chunk)
+                            prefix_cleaned = True
+                        if chunk:
+                            current_run_chunks.append(chunk)
+                            yield {"type": "delta", "text": chunk}
+                    continue
+
+                # Non-partial = aggregated event for this LLM call.
+                # Decide whether to keep or discard the deltas we just
+                # streamed.
+                if has_function_call:
+                    # Reasoning before a tool dispatch — wipe the bubble.
+                    if current_run_chunks:
+                        current_run_chunks = []
+                        yield {"type": "reset"}
+                else:
+                    # Plain-text aggregated event → those deltas were
+                    # real reply content. Commit them.
+                    kept_chunks.extend(current_run_chunks)
+                    current_run_chunks = []
+        except Exception:
+            logger.exception(
+                "ADK stream failed for session=%s mode=%s",
+                session_id,
+                input_mode,
+            )
+            # Fall through to fallback so the frontend still gets a
+            # ``done`` event and the UI doesn't hang on an empty stream.
+
+        # If the stream ended without a terminating aggregated event
+        # (network hiccup, model finish_reason oddity, etc.) treat any
+        # un-committed deltas as part of the reply so the user still
+        # sees the text they already saw on screen.
+        if current_run_chunks:
+            kept_chunks.extend(current_run_chunks)
+            current_run_chunks = []
+
+        reply = _strip_meta_markers("".join(kept_chunks).strip())
+
+        if not reply:
+            lang = language if language in {"en", "th"} else "en"
+            fallbacks: dict[tuple[str, str], str] = {
+                ("voice", "en"): "I'm sorry, could you describe your symptoms?",
+                ("voice", "th"): "ขอโทษนะคะ ช่วยบอกอาการของคุณได้ไหมคะ",
+                ("text", "en"): (
+                    "Please describe your symptoms so I can assess your situation."
+                ),
+                ("text", "th"): (
+                    "กรุณาบอกอาการของคุณ เพื่อให้เราช่วยประเมินสถานการณ์ได้"
+                ),
+            }
+            mode_key = "voice" if input_mode == "voice" else "text"
+            reply = fallbacks[(mode_key, lang)]
+            # Surface the fallback as a single delta so the client UI
+            # still sees the bubble fill with text even when streaming
+            # produced nothing.
+            yield {"type": "delta", "text": reply}
+
+        yield {
+            "type": "done",
+            "reply": reply,
+            "classification": classification,
+            "contact": contact,
+            "input_mode": input_mode,
+        }
+
+
+# ---------------------------------------------------------------------------
+# SECTION G — HotlineADKLiveRunner  (Gemini Live API bidirectional voice)
+# ---------------------------------------------------------------------------
+#
+# In google-adk 2.1.0 there is no separate ``LiveRunner`` class — the regular
+# ``Runner`` exposes ``run_live(...)`` for bidirectional streaming. We wrap a
+# Runner that shares the SAME root agent + tool set + session service the
+# text-mode runner uses, but lives under its own app_name so the live
+# session state is isolated from the text-mode chat history.
+#
+# Voice selection is per-session (caller's language is known at connect
+# time) and is supplied via ``RunConfig.speech_config``. Audio in/out
+# transcription is also turned on so callers' speech becomes text we can
+# feed back into ``triage_service.process_chat`` for DB persistence and
+# mock-notifier dispatch.
+
+LIVE_APP_NAME: str = "hospital-hotline-live"
+
+# Gemini Live API prebuilt voice. We pin a SINGLE voice across every
+# language for persona consistency — callers should hear the same
+# "hotline nurse" voice on every call, whether they're speaking English
+# or Thai. ``Aoede`` is the warm-female conversational voice and
+# renders both languages cleanly under the native-audio model. Picking
+# different voices per language (e.g. Aoede en / Charon th) made the
+# assistant sound like two different people, which the demo brief
+# explicitly called out.
+_VOICE_NAME: str = "Aoede"
+
+# BCP-47 language code we pin into the SpeechConfig so the upstream
+# model routes through the correct voice variant deterministically.
+# Without an explicit code Gemini Live infers one from the response
+# stream, and we observed that inference flipping between calls
+# (causing the "different voice every call" symptom). Pinning it
+# locks the rendering to a single consistent voice per language.
+_LANGUAGE_CODE_BY_LANG: dict[str, str] = {
+    "en": "en-US",
+    "th": "th-TH",
+}
+
+
+def _build_live_run_config(language: str) -> "genai_types.LiveConnectConfig | Any":
+    """Assemble the ``RunConfig`` ADK passes into the Gemini Live API.
+
+    Picks the prebuilt voice for the caller's language, enables audio-only
+    responses, and turns on both input and output transcription so the
+    service layer can replay the conversation into the existing text
+    pipeline (which handles DB writes and emergency notifications).
+    """
+
+    from google.adk.runners import RunConfig  # local import to avoid load-time cost
+
+    # Single voice across every language — see ``_VOICE_NAME`` docstring
+    # for why we deliberately don't switch per locale. Coupling
+    # ``voice_name`` with an explicit BCP-47 ``language_code`` locks the
+    # Gemini Live API into the same voice variant on every connect, so
+    # the assistant sounds like the same person every call.
+    bcp47 = _LANGUAGE_CODE_BY_LANG.get(language, _LANGUAGE_CODE_BY_LANG["en"])
+    speech_config = genai_types.SpeechConfig(
+        voice_config=genai_types.VoiceConfig(
+            prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
+                voice_name=_VOICE_NAME,
+            ),
+        ),
+        language_code=bcp47,
+    )
+
+    # Pin BOTH transcription streams to the session's language so the
+    # captions never cross-leak (caller speaks Thai → captions show
+    # Thai only; English session → English captions only). Without an
+    # explicit ``language_codes`` hint Gemini's transcriber
+    # auto-detects per-utterance and frequently flips mid-call if the
+    # caller's accent triggers a different language model. The hint
+    # also improves accuracy for monolingual sessions because the
+    # model can lean on the pinned language's lexicon instead of
+    # hedging across candidates.
+    transcription_config = genai_types.AudioTranscriptionConfig(
+        language_codes=[bcp47],
+    )
+    return RunConfig(
+        response_modalities=["AUDIO"],
+        speech_config=speech_config,
+        input_audio_transcription=transcription_config,
+        output_audio_transcription=transcription_config,
+    )
+
+
+class HotlineADKLiveRunner:
+    """Async facade around ADK's bidirectional live runner.
+
+    Shares the same Orchestrator + sub-agents + tool set that
+    :class:`HotlineADKRunner` uses, so a Level 1 / Level 2 classification
+    in a voice call still fires ``classify_triage_level`` and triggers
+    the EmergencyAgent handoff for contact collection. The only thing
+    that differs from text mode is the runner's ``app_name`` (so ADK
+    session state is namespaced separately) and the
+    :meth:`run_live` entry point.
+    """
+
+    def __init__(self) -> None:
+        # The Live API only accepts ``gemini-live-*-native-audio`` models, so
+        # we override the agents' model here instead of the Pro-tier text
+        # default. Reuses the same instructions / tools / sub-agent layout
+        # as HotlineADKRunner — only the wire model changes.
+        live_model = settings.google_live_model_name
+        triage_agent = _build_triage_agent(model_name=live_model)
+        emergency_agent = _build_emergency_agent(model_name=live_model)
+        self._root_agent: LlmAgent = _build_orchestrator(
+            triage_agent, emergency_agent, model_name=live_model
+        )
+        self._runner: Runner = Runner(
+            app_name=LIVE_APP_NAME,
+            agent=self._root_agent,
+            session_service=_SESSION_SERVICE,
+        )
+
+    async def ensure_live_session(
+        self, session_id: str, language: str
+    ) -> None:
+        """Idempotently materialise the live-mode ADK session.
+
+        Mirrors :meth:`HotlineADKRunner.ensure_adk_session` but binds to
+        the ``LIVE_APP_NAME`` namespace and pins ``input_mode`` to
+        ``"voice"`` in initial state since this session is voice-only by
+        definition.
+        """
+
+        existing = await _SESSION_SERVICE.get_session(
+            app_name=LIVE_APP_NAME,
+            user_id=session_id,
+            session_id=session_id,
+        )
+        if existing is not None:
+            return
+        await _SESSION_SERVICE.create_session(
+            app_name=LIVE_APP_NAME,
+            user_id=session_id,
+            session_id=session_id,
+            state={
+                "language": language,
+                "session_id": session_id,
+                "input_mode": "voice",
+            },
+        )
+
+    async def get_live_session_handler(
+        self, session_id: str, language: str
+    ) -> Runner:
+        """Make sure the ADK session is ready and return the underlying Runner.
+
+        The caller drives the live pipeline by invoking ``runner.run_live(
+        user_id=..., session_id=..., live_request_queue=..., run_config=...
+        )``. The session must exist before ``run_live`` is called or ADK
+        raises ``SessionNotFoundError``.
+        """
+
+        await self.ensure_live_session(session_id, language)
+        return self._runner
+
+    def build_run_config(self, language: str) -> Any:
+        """Public wrapper around :func:`_build_live_run_config` so callers
+        don't have to import the module-private helper.
+        """
+
+        return _build_live_run_config(language)

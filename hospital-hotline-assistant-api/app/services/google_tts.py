@@ -16,9 +16,18 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
+# One persona per language, used everywhere Cloud TTS plays back text
+# (chat playback, fallback synthesis). Picked to match the Gemini Live
+# prebuilt voices we use for live calls (`Aoede` en / `Charon` th) so
+# the assistant sounds like the same person across text-mode TTS and
+# voice-mode Live API:
+#   - en: en-US-Neural2-F — warm, calm female. Closer to Aoede than the
+#     older Standard-C voice (which sounded older and more robotic).
+#   - th: th-TH-Neural2-C — natural female Thai neural voice. Better
+#     prosody than Standard-A and pairs with Charon for Thai calls.
 _VOICE_BY_LANGUAGE: dict[str, dict[str, str]] = {
-    "en": {"language_code": "en-US", "name": "en-US-Standard-C"},
-    "th": {"language_code": "th-TH", "name": "th-TH-Standard-A"},
+    "en": {"language_code": "en-US", "name": "en-US-Neural2-F"},
+    "th": {"language_code": "th-TH", "name": "th-TH-Neural2-C"},
 }
 
 

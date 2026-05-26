@@ -3,6 +3,7 @@ import type {
   ApiError,
   ChatRequestPayload,
   ChatResponsePayload,
+  ChatStreamEvent,
   ConversationSummaryOut,
   DepartmentOut,
   DepartmentRecommendationCreate,
@@ -95,6 +96,79 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+
+  /**
+   * Open a streaming chat turn. Yields parsed event objects as the
+   * server emits them (Server-Sent Events / NDJSON-in-SSE framing).
+   *
+   * Event shapes mirror the backend's
+   * ``triage_service.process_chat_stream`` (see that docstring for the
+   * authoritative list). Use the ``signal`` to cancel mid-stream when
+   * the user navigates away or starts a new turn.
+   */
+  async *chatStream(
+    sessionId: string,
+    payload: ChatRequestPayload,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ChatStreamEvent, void, void> {
+    const response = await fetch(`${baseUrl}/sessions/${sessionId}/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      body: JSON.stringify(payload),
+      signal,
+    });
+    if (!response.ok || !response.body) {
+      throw new Error(await detailFromResponse(response));
+    }
+
+    // SSE parsing: frames are separated by ``\n\n``. Each frame has a
+    // ``data: <json>`` line we care about. We buffer partial frames
+    // across read() boundaries because TCP doesn't honour our nice
+    // logical message boundaries — a single chunk may end mid-JSON,
+    // or carry multiple events.
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let separator = buffer.indexOf('\n\n');
+        while (separator !== -1) {
+          const frame = buffer.slice(0, separator);
+          buffer = buffer.slice(separator + 2);
+          separator = buffer.indexOf('\n\n');
+
+          // A single SSE frame may contain multiple ``data:`` lines (the
+          // spec concatenates them with newlines). Hospital Hotline only
+          // emits one per frame, but handle the general case for safety.
+          const dataLines = frame
+            .split('\n')
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trimStart());
+          if (dataLines.length === 0) continue;
+          const payloadStr = dataLines.join('\n');
+          try {
+            const event = JSON.parse(payloadStr) as ChatStreamEvent;
+            yield event;
+          } catch {
+            // Drop frames we can't parse rather than throwing — a
+            // truncated/proxy-mangled frame should never tear down the
+            // whole stream.
+          }
+        }
+      }
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        // ignore
+      }
+    }
+  },
 
   createSymptomEntry: (sessionId: string, payload: SymptomEntryCreate) =>
     request<Record<string, unknown>>(`/sessions/${sessionId}/symptoms`, {

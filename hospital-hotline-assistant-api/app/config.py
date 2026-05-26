@@ -21,7 +21,18 @@ class Settings(BaseSettings):
     alert_cooldown_seconds: int = 300
     google_cloud_project: str | None = None
     google_cloud_location: str = "us-central1"
-    google_model_name: str = "gemini-2.5-flash"
+    # Text / chat mode model. ``gemini-2.5-pro`` is the highest GA Pro-tier
+    # model on Vertex AI as of May 2026 — top quality, supports streaming,
+    # tool calls, and multimodal, and works on standard (non-preview-gated)
+    # Vertex projects. To try preview tiers like ``gemini-3.1-pro-preview``
+    # or the newer ``gemini-3.5-flash``, override ``GOOGLE_MODEL_NAME`` in
+    # ``.env`` after confirming your project's been allowlisted.
+    google_model_name: str = "gemini-2.5-pro"
+    # Live API (voice WebSocket) model. The Gemini Live API has its own
+    # dedicated model family — Pro tier is NOT available for live audio
+    # on Vertex. ``gemini-live-2.5-flash-native-audio`` is the only GA
+    # Live model as of May 2026 (released Dec 2025, retires Dec 2026).
+    google_live_model_name: str = "gemini-live-2.5-flash-native-audio"
     google_application_credentials: str | None = None
     # ADK now drives the triage agent and assumes Google AI is online,
     # so the default flips on. Override to False in non-AI test envs.

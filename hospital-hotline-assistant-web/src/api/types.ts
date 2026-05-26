@@ -185,6 +185,32 @@ export interface SttResponsePayload {
   language_code: string;
 }
 
+/**
+ * One frame emitted by ``POST /sessions/{id}/chat/stream``. The shape
+ * mirrors :meth:`triage_service.process_chat_stream` — every frame
+ * carries a ``type`` discriminator and the payload fields it needs.
+ *
+ * Frame ordering for a successful turn:
+ *   1. ``user_message`` (once, with the persisted DB row)
+ *   2. zero or more ``delta`` frames (typewriter text)
+ *   3. zero or one ``classified`` frame (TriageAgent classified)
+ *   4. zero or one ``contact`` frame (EmergencyAgent collected)
+ *   5. ``complete`` (once, with full assessment + assistant DB row)
+ * Errors interrupt with a single ``error`` frame.
+ */
+export type ChatStreamEvent =
+  | { type: 'user_message'; message: MessageOut }
+  | { type: 'delta'; text: string }
+  | { type: 'reset' }
+  | { type: 'classified'; classification: Record<string, unknown> }
+  | { type: 'contact'; contact: Record<string, unknown> }
+  | {
+      type: 'complete';
+      result: ChatResponsePayload;
+      assistant_message: MessageOut;
+    }
+  | { type: 'error'; message: string };
+
 export interface ApiError {
   detail: string;
 }

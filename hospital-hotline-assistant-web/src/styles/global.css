@@ -486,6 +486,28 @@ a:hover {
   white-space: pre-wrap;
 }
 
+/* Streaming assistant bubble: blinking caret to signal "still
+   generating". The bubble itself reuses .message-bubble.assistant so
+   it slots into the chat list with no extra colours / layout changes
+   — only the cursor element is bespoke. */
+.message-bubble.streaming {
+  position: relative;
+}
+
+.streaming-cursor {
+  display: inline-block;
+  margin-left: 2px;
+  animation: streaming-blink 1s steps(2, start) infinite;
+  color: var(--mch-cyan);
+  font-weight: 600;
+}
+
+@keyframes streaming-blink {
+  to {
+    opacity: 0;
+  }
+}
+
 .typing-indicator {
   display: flex;
   align-items: center;
@@ -1164,6 +1186,43 @@ a:hover {
 }
 
 .call-btn-hangup .call-btn-icon svg {
+  width: 22px;
+  height: 22px;
+  fill: #ffffff;
+}
+
+.call-btn.mute {
+  min-width: 160px;
+  background: linear-gradient(135deg, #4a5b76 0%, #2f3b50 100%);
+  color: #ffffff;
+}
+
+.call-btn.mute.is-muted {
+  background: linear-gradient(135deg, var(--mch-red) 0%, var(--mch-red-dark) 100%);
+  color: #ffffff;
+}
+
+.call-btn-mute .call-btn-icon svg {
+  width: 22px;
+  height: 22px;
+  fill: #ffffff;
+}
+
+/* Speaker toggle mirrors the mute button's two-state look so the two
+   inline controls feel like a matched pair: neutral steel when active
+   (audio playing), red when toggled off so the user's eye catches it. */
+.call-btn.speaker {
+  min-width: 160px;
+  background: linear-gradient(135deg, #4a5b76 0%, #2f3b50 100%);
+  color: #ffffff;
+}
+
+.call-btn.speaker.is-off {
+  background: linear-gradient(135deg, var(--mch-red) 0%, var(--mch-red-dark) 100%);
+  color: #ffffff;
+}
+
+.call-btn-speaker .call-btn-icon svg {
   width: 22px;
   height: 22px;
   fill: #ffffff;
